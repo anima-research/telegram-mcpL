@@ -3,6 +3,7 @@
 from mcp.server.fastmcp import FastMCP
 
 from telegram_mcp.mcpl import MCPL_VERSION
+from telegram_mcp.mcpl.policy import FS_NAME, FS_USES
 from telegram_mcp.mcpl.capabilities import (
     build_experimental_capabilities,
     build_mcpl_capabilities,
@@ -10,16 +11,34 @@ from telegram_mcp.mcpl.capabilities import (
 
 
 def test_mcpl_version_pinned():
-    assert MCPL_VERSION == "0.4"
+    assert MCPL_VERSION == "0.5"
 
 
 def test_capabilities_shape():
     caps = build_mcpl_capabilities()
-    assert caps["version"] == "0.4"
-    assert caps["pushEvents"] is True
-    assert caps["channels"]["register"] is True
-    assert caps["channels"]["publish"] is True
-    assert caps["channels"]["lifecycle"] is True
+    assert caps["version"] == "0.5"
+    # never emitted → not advertised (§6.4 honesty)
+    assert caps["pushEvents"] is False
+    assert caps["channels"] == {
+        "register": True,
+        "publish": True,
+        "incoming": True,
+        "lifecycle": True,
+        "typing": True,
+        "streaming": False,
+        "acknowledge": False,
+    }
+    # §6.1 Record form; `uses` names exactly the capabilities we exercise
+    fs = caps["featureSets"][FS_NAME]
+    assert fs["description"]
+    assert set(fs["uses"]) == set(FS_USES)
+    assert "channels.incoming" in fs["uses"] and "channels.register" in fs["uses"]
+    # every `uses` entry is advertised, so the host's §6.4 derivation can pass
+    for cap in FS_USES:
+        if cap == "tools":
+            continue  # outer MCP capability, not part of the manifest
+        head, leaf = cap.split(".")
+        assert caps[head][leaf] is True, cap
 
 
 def test_experimental_wrapper_namespaces_under_mcpl():
@@ -36,5 +55,5 @@ def test_capabilities_flow_through_create_initialization_options():
     )
     assert opts.capabilities.experimental is not None
     assert "mcpl" in opts.capabilities.experimental
-    assert opts.capabilities.experimental["mcpl"]["version"] == "0.4"
-    assert opts.capabilities.experimental["mcpl"]["pushEvents"] is True
+    assert opts.capabilities.experimental["mcpl"]["version"] == "0.5"
+    assert FS_NAME in opts.capabilities.experimental["mcpl"]["featureSets"]

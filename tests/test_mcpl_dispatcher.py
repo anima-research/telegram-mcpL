@@ -1,11 +1,14 @@
 """Phase 2 tests — dispatcher routing logic, decoupled from real I/O."""
 
 import asyncio
+import json
 from typing import Any
 
+import anyio
 import pytest
 
 from telegram_mcp.mcpl.dispatcher import McplDispatcher, McplError
+from telegram_mcp.mcpl.transport import McplTransport
 
 
 class FakeTransport:
@@ -17,9 +20,7 @@ class FakeTransport:
         self.requests: list[tuple[int, str, dict]] = []
         self.notifications: list[tuple[str, dict | None]] = []
 
-    async def send_error(
-        self, msg_id: Any, code: int, message: str, data: Any = None
-    ) -> None:
+    async def send_error(self, msg_id: Any, code: int, message: str, data: Any = None) -> None:
         self.errors.append((msg_id, code, message))
 
     async def send_response(self, msg_id: Any, result: Any) -> None:
@@ -35,7 +36,9 @@ class FakeTransport:
 @pytest.mark.asyncio
 async def test_request_with_handler_returns_result():
     d = McplDispatcher()
-    d.register("channels/publish", lambda params: _async_result({"delivered": True, "messageId": "42"}))
+    d.register(
+        "channels/publish", lambda params: _async_result({"delivered": True, "messageId": "42"})
+    )
     t = FakeTransport()
 
     await d.handle_inbound(
@@ -113,9 +116,7 @@ async def test_outbound_request_correlates_response_by_id():
         msg_id = t.requests[-1][0]
         d.resolve_outbound(msg_id, {"jsonrpc": "2.0", "id": msg_id, "result": {"ok": True}})
 
-    request_task = asyncio.create_task(
-        d.send_request("channels/incoming", {"messages": []}, t)
-    )
+    request_task = asyncio.create_task(d.send_request("channels/incoming", {"messages": []}, t))
     driver_task = asyncio.create_task(driver())
     result, _ = await asyncio.gather(request_task, driver_task)
 
@@ -142,9 +143,7 @@ async def test_outbound_request_raises_on_error_response():
             },
         )
 
-    request_task = asyncio.create_task(
-        d.send_request("channels/incoming", {"messages": []}, t)
-    )
+    request_task = asyncio.create_task(d.send_request("channels/incoming", {"messages": []}, t))
     driver_task = asyncio.create_task(driver())
 
     with pytest.raises(McplError) as exc_info:
@@ -159,3 +158,37 @@ async def test_outbound_request_raises_on_error_response():
 
 async def _async_result(value):
     return value
+
+
+# ---------------------------------------------------------------------------
+# Frame-aware handlers (featureSets/update is dual-mode, §6.7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_frame_aware_handler_sees_request_vs_notification():
+    dispatcher = McplDispatcher()
+    transport = McplTransport(dispatcher)
+    send_stream, receive_stream = anyio.create_memory_object_stream(4)
+    transport._bind_write_stream(send_stream)
+    seen = []
+
+    async def handler(params, is_request):
+        seen.append((params, is_request))
+        return {"accepted": True} if is_request else None
+
+    dispatcher.register_frame_aware("featureSets/update", handler)
+
+    await dispatcher.handle_inbound(
+        {"jsonrpc": "2.0", "id": 3, "method": "featureSets/update", "params": {"a": 1}}, transport
+    )
+    await dispatcher.handle_inbound(
+        {"jsonrpc": "2.0", "method": "featureSets/update", "params": {"b": 2}}, transport
+    )
+    assert seen == [({"a": 1}, True), ({"b": 2}, False)]
+    payload = json.loads(
+        receive_stream.receive_nowait().message.model_dump_json(by_alias=True, exclude_none=True)
+    )
+    assert payload == {"jsonrpc": "2.0", "id": 3, "result": {"accepted": True}}
+    with pytest.raises(anyio.WouldBlock):
+        receive_stream.receive_nowait()  # notification produced no response

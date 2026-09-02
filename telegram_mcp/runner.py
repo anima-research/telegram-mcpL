@@ -9,9 +9,12 @@ except UnsafeInstallationError as exc:
 
 from telegram_mcp.runtime import *
 import telegram_mcp.tools  # noqa: F401 - registers MCP tools via decorators
+from telegram_mcp.mcpl.capabilities import build_mcpl_capabilities
 from telegram_mcp.mcpl.channels import enumerate_channels
 from telegram_mcp.mcpl.dispatcher import McplDispatcher
 from telegram_mcp.mcpl.events import attach_event_handlers
+from telegram_mcp.mcpl.policy import PolicyState
+from telegram_mcp.mcpl.ready import make_on_ready
 from telegram_mcp.mcpl.handlers import (
     make_close_handler,
     make_list_handler,
@@ -19,12 +22,25 @@ from telegram_mcp.mcpl.handlers import (
     make_publish_handler,
     make_typing_handler,
 )
-from telegram_mcp.mcpl.transport import McplTransport, run_stdio_with_mcpl
+from telegram_mcp.mcpl.transport import run_stdio_with_mcpl
 
 
-def _build_dispatcher() -> McplDispatcher:
+def _build_dispatcher(policy: PolicyState) -> McplDispatcher:
     """Construct the MCPL dispatcher with all server-side handlers wired in."""
     dispatcher = McplDispatcher()
+
+    # MCPL 0.5 §5.3/§6.7 — the host's policy exchange. Request form returns the
+    # degradation receipt; Notification form may only narrow.
+    async def handle_feature_sets_update(params, is_request: bool):
+        return policy.apply(params, is_request=is_request)
+
+    dispatcher.register_frame_aware("featureSets/update", handle_feature_sets_update)
+
+    # §17.4 — the complete current manifest, same shape initialize carries.
+    async def handle_manifest(params):
+        return build_mcpl_capabilities()
+
+    dispatcher.register("mcpl/manifest", handle_manifest)
     dispatcher.register(
         "channels/publish",
         make_publish_handler(
@@ -47,44 +63,18 @@ def _build_dispatcher() -> McplDispatcher:
     return dispatcher
 
 
-async def _build_on_ready_hook():
-    """After the host signals it's initialized: enumerate Telegram dialogs
-    across all accounts, register them as MCPL channels, and attach the
-    Telethon event handlers that translate NewMessage events into
-    `channels/incoming` pushes.
+def _build_on_ready_hook(policy: PolicyState):
+    """After the host signals it's initialized: wait for the 0.5 policy
+    receipt, register Telegram dialogs as MCPL channels (if granted), and
+    attach the Telethon event handlers that translate NewMessage events into
+    `channels/incoming` pushes gated on the live grant. See mcpl/ready.py.
     """
-
-    async def on_ready(transport: McplTransport) -> None:
-        all_channels = []
-        for label, cl in clients.items():
-            try:
-                channels = await enumerate_channels(cl, label)
-                all_channels.extend(channels)
-            except Exception as exc:  # noqa: BLE001 — never block the agent on enumeration
-                print(
-                    f"Failed to enumerate channels for account '{label}': {exc}",
-                    file=sys.stderr,
-                )
-        await transport.send_notification(
-            "channels/register", {"channels": all_channels}
-        )
-        print(
-            f"Registered {len(all_channels)} MCPL channels with host",
-            file=sys.stderr,
-        )
-
-        for label, cl in clients.items():
-            try:
-                await attach_event_handlers(
-                    cl, account_label=label, transport=transport
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"Failed to attach event handlers for account '{label}': {exc}",
-                    file=sys.stderr,
-                )
-
-    return on_ready
+    return make_on_ready(
+        clients,
+        policy=policy,
+        enumerate_channels=enumerate_channels,
+        attach_event_handlers=attach_event_handlers,
+    )
 
 
 async def _main() -> None:
@@ -103,8 +93,9 @@ async def _main() -> None:
         # initialize handshake, registers Telegram dialogs as MCPL channels
         # once the host signals ready, and exposes channels/publish so the
         # host can send messages through us.
-        on_ready = await _build_on_ready_hook()
-        dispatcher = _build_dispatcher()
+        policy = PolicyState()
+        on_ready = _build_on_ready_hook(policy)
+        dispatcher = _build_dispatcher(policy)
         await run_stdio_with_mcpl(mcp, dispatcher=dispatcher, on_ready=on_ready)
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)

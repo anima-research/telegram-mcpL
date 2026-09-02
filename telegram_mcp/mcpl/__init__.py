@@ -9,6 +9,8 @@ provided by FastMCP. The standard MCP tool surface (send_message, list_chats,
   - push events (Telethon NewMessage → channels/incoming)
   - host → server publish (channels/publish → Telethon send_message)
   - lifecycle methods (channels/list/open/close, channels/typing)
+  - negotiated policy (featureSets/update Request → degradation receipt,
+    MCPL 0.5 §5.3/§6.7) gating registration and pushes on the grant
 
 Reference: mcpl/SPEC.md in the connectome-typescript monorepo, and the Java
 precedent at discord-mcp/src/main/java/dev/saseq/mcpl/.
@@ -29,5 +31,5 @@ Resilience model:
     the host to re-fetch the dialog set on demand.
 """
 
-MCPL_VERSION = "0.4"
+MCPL_VERSION = "0.5"
 """Protocol version advertised in capabilities.experimental.mcpl.version."""

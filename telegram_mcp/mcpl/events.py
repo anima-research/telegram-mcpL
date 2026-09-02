@@ -36,6 +36,7 @@ from .content import message_to_content_blocks
 from .types import ChannelIncomingMessage
 
 if TYPE_CHECKING:
+    from .policy import PolicyState
     from .transport import McplTransport
 
 log = logging.getLogger("telegram_mcp.mcpl")
@@ -134,9 +135,7 @@ def _prepend_speaker_header(
     leading text block if there isn't one). Returns a new list — does not
     mutate the input."""
     out = list(content)
-    first_text_idx = next(
-        (i for i, b in enumerate(out) if b.get("type") == "text"), None
-    )
+    first_text_idx = next((i for i, b in enumerate(out) if b.get("type") == "text"), None)
     if first_text_idx is not None:
         existing = out[first_text_idx].get("text", "")
         out[first_text_idx] = {"type": "text", "text": f"{header}{existing}"}
@@ -183,9 +182,7 @@ async def build_incoming_message(
     """
     message = event.message
     chat = await event.get_chat()
-    descriptor = entity_to_descriptor(
-        chat, account_label=account_label, self_id=self_id
-    )
+    descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
     if descriptor is None:
         return None
 
@@ -197,7 +194,9 @@ async def build_incoming_message(
     mention_ids = _extract_mention_ids(message)
     is_username_mention = _has_username_mention(message, self_username)
     is_explicit_mention = self_id in mention_ids
-    is_mention = bool(getattr(message, "mentioned", False)) or is_username_mention or is_explicit_mention
+    is_mention = (
+        bool(getattr(message, "mentioned", False)) or is_username_mention or is_explicit_mention
+    )
 
     chat_kind = descriptor["metadata"]["kind"]
     chat_id = descriptor["address"]["peerId"]
@@ -327,16 +326,12 @@ async def _build_chat_action_payload(
 
     chat = await event.get_chat()
     if user_left or user_kicked:
-        descriptor = entity_to_descriptor(
-            chat, account_label=account_label, self_id=self_id
-        )
+        descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
         if descriptor is None:
             return None
         return {"removed": [descriptor["id"]]}
     if user_added or user_joined:
-        descriptor = entity_to_descriptor(
-            chat, account_label=account_label, self_id=self_id
-        )
+        descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
         if descriptor is None:
             return None
         return {"added": [descriptor]}
@@ -348,12 +343,19 @@ async def attach_event_handlers(
     *,
     account_label: str,
     transport: McplTransport,
+    policy: PolicyState | None = None,
 ) -> None:
     """Register Telethon event handlers for one client.
 
     Currently:
       - NewMessage → channels/incoming
       - ChatAction → channels/changed (joins, leaves, kicks affecting us)
+
+    `policy` (MCPL 0.5, §5.4): when given, every push is checked against the
+    negotiated grant at emission time — `channels/incoming` needs
+    `channels.incoming`, `channels/changed` needs `channels.register`. A
+    reduction takes effect on the very next event. `None` keeps the pre-0.5
+    ungated behaviour (tests, legacy hosts).
 
     Idempotent: attaching twice on the same client is a no-op. Telethon
     happily registers duplicate handlers, so we guard with a per-client
@@ -388,9 +390,15 @@ async def attach_event_handlers(
             )
             if payload is None:
                 return
-            await transport.send_notification(
-                "channels/incoming", {"messages": [payload]}
-            )
+            if policy is not None and not policy.can_push_incoming:
+                log.info(
+                    "channels/incoming suppressed — channels.incoming not granted "
+                    "(policy_received=%s fs_enabled=%s)",
+                    policy.policy_received,
+                    policy.fs_enabled,
+                )
+                return
+            await transport.send_notification("channels/incoming", {"messages": [payload]})
         except Exception:
             log.exception("Failed to push NewMessage event")
 
@@ -402,14 +410,16 @@ async def attach_event_handlers(
             )
             if payload is None:
                 return
+            if policy is not None and not policy.can_register:
+                log.info("channels/changed suppressed — channels.register not granted")
+                return
             await transport.send_notification("channels/changed", payload)
         except Exception:
             log.exception("Failed to push ChatAction event")
 
     _attached_clients.add(id(client))
     log.info(
-        "Attached MCPL handlers (NewMessage, ChatAction) for account '%s' "
-        "(self_id=%s)",
+        "Attached MCPL handlers (NewMessage, ChatAction) for account '%s' " "(self_id=%s)",
         account_label,
         self_id,
     )

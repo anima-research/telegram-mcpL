@@ -39,6 +39,7 @@ MCPL_METHODS: frozenset[str] = frozenset(
         "channels/publish",
         "channels/typing",
         "featureSets/update",
+        "mcpl/manifest",
         "state/rollback",
         "context/beforeInference",
         "context/afterInference",
@@ -57,13 +58,15 @@ class McplError(Exception):
 
 
 HandlerFn = Callable[[dict[str, Any]], Awaitable[Any]]
+FrameAwareHandlerFn = Callable[[dict[str, Any], bool], Awaitable[Any]]
 
 
 class McplDispatcher:
     """Routes MCPL frames between the transport and the per-method handlers."""
 
     def __init__(self) -> None:
-        self._handlers: dict[str, HandlerFn] = {}
+        self._handlers: dict[str, Any] = {}
+        self._frame_aware: set[str] = set()
         self._pending_outbound: dict[int, asyncio.Future[Any]] = {}
         self._next_id: int = 1
 
@@ -72,6 +75,16 @@ class McplDispatcher:
     def register(self, method: str, handler: HandlerFn) -> None:
         """Register an async handler for an inbound MCPL request method."""
         self._handlers[method] = handler
+
+    def register_frame_aware(self, method: str, handler: FrameAwareHandlerFn) -> None:
+        """Register a handler that also needs to know whether the frame was a
+        Request (`id` present) or a Notification. `featureSets/update` is
+        dual-mode (§6.7): the Request form establishes the grant and gets a
+        receipt, the Notification form may only narrow. The handler receives
+        `(params, is_request)`; its return value is sent as the response only
+        for Requests."""
+        self._handlers[method] = handler
+        self._frame_aware.add(method)
 
     # -- inbound dispatch -----------------------------------------------------
 
@@ -103,7 +116,10 @@ class McplDispatcher:
             return
 
         try:
-            result = await handler(params)
+            if method in self._frame_aware:
+                result = await handler(params, msg_id is not None)
+            else:
+                result = await handler(params)
         except Exception as exc:  # noqa: BLE001 — JSON-RPC requires we capture all
             log.exception("MCPL handler %s raised", method)
             if msg_id is not None:

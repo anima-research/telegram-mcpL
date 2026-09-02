@@ -560,3 +560,77 @@ async def test_supergroup_forum_topic_emits_threadId():
     assert out is not None
     assert out["threadId"] == "7"
     assert out["channelId"] == "telegram:default:supergroup:1000"
+
+
+# ---------------------------------------------------------------------------
+# MCPL 0.5 — pushes are gated on the negotiated grant at emission time
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_new_message_push_is_gated_on_channels_incoming_grant(monkeypatch):
+    import telegram_mcp.mcpl.events as events_mod
+    from telegram_mcp.mcpl.policy import FS_NAME, FS_USES, PolicyState
+
+    reset_attached_clients()
+
+    class FakeMe:
+        id = 99
+        username = "mybot"
+
+    class FakeClient:
+        def __init__(self):
+            self.handlers: dict = {}
+
+        async def get_me(self):
+            return FakeMe()
+
+        def on(self, event_filter):
+            def decorator(fn):
+                name = getattr(event_filter, "__name__", type(event_filter).__name__)
+                self.handlers[name] = fn
+                return fn
+
+            return decorator
+
+    sent: list = []
+
+    class FakeTransport:
+        async def send_notification(self, method, params=None):
+            sent.append((method, params))
+
+    async def fake_build(event, **kwargs):
+        return {"channelId": "telegram:default:dm:1", "messageId": "7", "content": []}
+
+    monkeypatch.setattr(events_mod, "build_incoming_message", fake_build)
+
+    policy = PolicyState()
+    client = FakeClient()
+    await attach_event_handlers(
+        client, account_label="default", transport=FakeTransport(), policy=policy
+    )
+    on_new_message = client.handlers["NewMessage"]
+    event = SimpleNamespace(out=False)
+
+    # 1. before any policy: suppressed
+    await on_new_message(event)
+    assert sent == []
+
+    # 2. granted: delivered
+    policy.apply({"effectiveCapabilities": list(FS_USES), "enabled": [FS_NAME]}, is_request=True)
+    await on_new_message(event)
+    assert [m for m, _ in sent] == ["channels/incoming"]
+    assert sent[0][1]["messages"][0]["messageId"] == "7"
+
+    # 3. reduction removes channels.incoming: suppressed again, no restart needed
+    policy.apply(
+        {"effectiveCapabilities": [c for c in FS_USES if c != "channels.incoming"]},
+        is_request=True,
+    )
+    await on_new_message(event)
+    assert len(sent) == 1
+
+    # own outgoing messages never echo regardless of grant
+    policy.apply({"effectiveCapabilities": list(FS_USES)}, is_request=True)
+    await on_new_message(SimpleNamespace(out=True))
+    assert len(sent) == 1

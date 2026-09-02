@@ -99,3 +99,6 @@ source = [
 show_missing = true
 skip_covered = true
 fail_under = 80
+
+[tool.uv]
+package = false
