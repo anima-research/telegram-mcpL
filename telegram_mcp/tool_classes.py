@@ -148,20 +148,23 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "unblock_user": _COMMS_CONTROL,
     # --- comms + control + files ---------------------------------------------
     "edit_chat_photo": ("comms", "control", "files"),
+    # --- comms + control: account settings that carry other people ----------
+    # Folder listings return chat titles (in private chats, a person's name);
+    # privacy rules read and write lists of specific users to allow or block.
+    "list_folders": _COMMS_CONTROL,
+    "get_folder": _COMMS_CONTROL,
+    "get_privacy_settings": _COMMS_CONTROL,
+    "set_privacy_settings": _COMMS_CONTROL,
     # --- control: the account's own settings, folders and chat state ---------
     "mute_chat": _CONTROL,
     "unmute_chat": _CONTROL,
     "archive_chat": _CONTROL,
     "unarchive_chat": _CONTROL,
-    "list_folders": _CONTROL,
-    "get_folder": _CONTROL,
     "create_folder": _CONTROL,
     "add_chat_to_folder": _CONTROL,
     "remove_chat_from_folder": _CONTROL,
     "delete_folder": _CONTROL,
     "reorder_folders": _CONTROL,
-    "get_privacy_settings": _CONTROL,
-    "set_privacy_settings": _CONTROL,
     "list_accounts": _CONTROL,
     "get_me": _CONTROL,
     "set_bot_commands": _CONTROL,
