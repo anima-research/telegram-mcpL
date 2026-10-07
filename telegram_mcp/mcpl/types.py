@@ -80,6 +80,9 @@ class ChannelDescriptor(TypedDict, total=False):
     direction: Literal["outbound", "inbound", "bidirectional"]
     address: dict[str, Any]
     metadata: dict[str, Any]
+    # Per-channel capabilities (Section 14.2), e.g. RFC-011's
+    # {"publish": {"target": "exact" | "root"}}.
+    capabilities: dict[str, Any]
 
 
 class ChannelAuthor(TypedDict):
@@ -116,11 +119,18 @@ class ChannelsPublishParams(TypedDict, total=False):
     channelId: str
     stream: bool
     content: list[McplContentBlock]
+    # RFC-011: a forum topic id, None for the chat itself, absent for legacy.
+    threadId: str | None
+    # This server's own extension (not in the MCPL spec).
+    replyToMessageId: str
 
 
 class ChannelsPublishResult(TypedDict, total=False):
     delivered: bool
     messageId: str
+    # RFC-011: where the post landed (topic id, or None), when one was asked.
+    threadId: str | None
+    reason: str
 
 
 # ---------------------------------------------------------------------------

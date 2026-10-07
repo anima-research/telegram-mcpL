@@ -163,7 +163,58 @@ def entity_to_descriptor(
     if kind == "supergroup" and forum:
         descriptor["metadata"]["forum"] = True
 
+    descriptor["capabilities"] = publish_capabilities(kind == "supergroup" and bool(forum))
     return descriptor
+
+
+class PublishDeclarations:
+    """What the host was last told about where a publish lands in each
+    registered chat (RFC-011 `capabilities.publish.target`).
+
+    A supergroup can turn its forum on or off after registration. A topic
+    message from a chat still declared `root` would contradict the
+    declaration (RFC-011 §3), so the changed descriptor is re-declared,
+    through `channels/changed`, before anything that depends on it.
+    """
+
+    def __init__(self) -> None:
+        self._targets: dict[str, str | None] = {}
+
+    @staticmethod
+    def _target(descriptor: dict[str, Any]) -> str | None:
+        return descriptor.get("capabilities", {}).get("publish", {}).get("target")
+
+    def record(self, descriptors: list[ChannelDescriptor]) -> None:
+        for d in descriptors:
+            self._targets[d["id"]] = self._target(d)
+
+    def forget(self, channel_ids: list[str]) -> None:
+        for channel_id in channel_ids:
+            self._targets.pop(channel_id, None)
+
+    def is_stale(self, descriptor: ChannelDescriptor) -> bool:
+        """True when this registered chat's declaration no longer matches."""
+        channel_id = descriptor["id"]
+        return channel_id in self._targets and self._targets[channel_id] != self._target(descriptor)
+
+    def reset(self) -> None:
+        self._targets.clear()
+
+
+# One per process, like the event handlers it serves (see events.py).
+publish_declarations = PublishDeclarations()
+
+
+def publish_capabilities(forum: bool) -> dict[str, Any]:
+    """Where a channels/publish lands (MCPL RFC-011 `capabilities.publish`).
+
+    A forum supergroup holds topics, and a publish naming one lands exactly
+    in that topic, or in the chat itself (General) for None, or fails with
+    nothing posted: `exact`. Every other chat has no threads inside it, so a
+    publish lands in the chat itself: `root`. A chat that turns its forum on
+    or off is re-declared the next time its descriptor is sent.
+    """
+    return {"publish": {"target": "exact" if forum else "root"}}
 
 
 async def enumerate_channels(
@@ -210,6 +261,7 @@ async def enumerate_channels(
                     "account": account_label,
                     "kind": "saved",
                 },
+                "capabilities": publish_capabilities(False),
             }
         )
 

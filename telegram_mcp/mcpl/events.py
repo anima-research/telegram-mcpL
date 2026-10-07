@@ -31,7 +31,7 @@ from telethon.tl.types import (
     User,
 )
 
-from .channels import channel_id_for, entity_to_descriptor
+from .channels import channel_id_for, entity_to_descriptor, publish_declarations
 from .content import message_to_content_blocks
 from .types import ChannelIncomingMessage
 
@@ -338,6 +338,34 @@ async def _build_chat_action_payload(
     return None
 
 
+async def redeclare_publish_target(
+    chat: Any,
+    *,
+    account_label: str,
+    self_id: int,
+    transport: McplTransport,
+    policy: PolicyState | None = None,
+) -> bool:
+    """Re-declare a registered chat whose publish target changed (RFC-011).
+
+    A supergroup that turned its forum on after registration still stands
+    declared `root`, and its topic messages would contradict that; one that
+    turned it off would keep `exact`. Sends `channels/changed` with the
+    current descriptor before the caller forwards anything from the chat, on
+    the same transport, so the host has the update first. Returns whether it
+    re-declared.
+    """
+    current = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
+    if current is None or not publish_declarations.is_stale(current):
+        return False
+    if policy is not None and not policy.can_register:
+        log.info("channels/changed (publish target) suppressed — channels.register not granted")
+        return False
+    await transport.send_notification("channels/changed", {"updated": [current]})
+    publish_declarations.record([current])
+    return True
+
+
 async def attach_event_handlers(
     client: TelegramClient,
     *,
@@ -398,6 +426,17 @@ async def attach_event_handlers(
                     policy.fs_enabled,
                 )
                 return
+            if payload.get("threadId") is not None:
+                # A topic message from a chat registered before its forum was
+                # turned on would contradict a `root` declaration: re-declare
+                # it first (RFC-011 §3).
+                await redeclare_publish_target(
+                    await event.get_chat(),
+                    account_label=account_label,
+                    self_id=self_id,
+                    transport=transport,
+                    policy=policy,
+                )
             await transport.send_notification("channels/incoming", {"messages": [payload]})
         except Exception:
             log.exception("Failed to push NewMessage event")
@@ -414,6 +453,8 @@ async def attach_event_handlers(
                 log.info("channels/changed suppressed — channels.register not granted")
                 return
             await transport.send_notification("channels/changed", payload)
+            publish_declarations.record(payload.get("added", []))
+            publish_declarations.forget(payload.get("removed", []))
         except Exception:
             log.exception("Failed to push ChatAction event")
 
