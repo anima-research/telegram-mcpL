@@ -20,6 +20,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .channels import publish_declarations
 from .policy import PolicyState, host_speaks_0_5
 from .transport import McplTransport
 
@@ -83,6 +84,7 @@ def make_on_ready(
             except Exception as exc:  # noqa: BLE001 — never block the agent on enumeration
                 log.error("Failed to enumerate channels for account '%s': %s", label, exc)
         await transport.send_notification("channels/register", {"channels": all_channels})
+        publish_declarations.record(all_channels)
         log.info("Registered %d MCPL channels with host", len(all_channels))
 
         await _attach_all(clients, transport, policy, attach_event_handlers)

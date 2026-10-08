@@ -20,6 +20,7 @@ from telegram_mcp.mcpl.handlers import (
     make_list_handler,
     make_open_handler,
     make_publish_handler,
+    publish_frame_handler,
     make_typing_handler,
 )
 from telegram_mcp.mcpl.transport import run_stdio_with_mcpl
@@ -41,12 +42,14 @@ def _build_dispatcher(policy: PolicyState) -> McplDispatcher:
         return build_mcpl_capabilities()
 
     dispatcher.register("mcpl/manifest", handle_manifest)
-    dispatcher.register(
+    dispatcher.register_frame_aware(
         "channels/publish",
-        make_publish_handler(
-            clients,
-            resolve_entity_fn=resolve_entity,
-            ensure_connected_fn=ensure_connected,
+        publish_frame_handler(
+            make_publish_handler(
+                clients,
+                resolve_entity_fn=resolve_entity,
+                ensure_connected_fn=ensure_connected,
+            )
         ),
     )
     dispatcher.register("channels/list", make_list_handler(clients))

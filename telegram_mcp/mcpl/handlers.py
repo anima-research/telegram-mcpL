@@ -1,7 +1,9 @@
 """Inbound MCPL handlers — methods the host calls on us.
 
   - channels/publish — send agent's content via the right Telethon client.
-    Honors a custom `replyToMessageId` extension (not in the base MCPL
+    Honors MCPL RFC-011 `threadId` (a forum topic id, or None for the chat
+    itself), posting exactly there or failing with nothing posted. Without
+    it, honors a custom `replyToMessageId` extension (not in the base MCPL
     spec) which also auto-threads into the right forum topic when the
     original message lived in one.
   - channels/typing — fire a brief typing indicator on the target chat.
@@ -14,9 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from telethon import TelegramClient
+from telethon.errors import RPCError
+from telethon.tl import functions, types
 
 from .channels import enumerate_channels
 from .types import ChannelsPublishParams, ChannelsPublishResult, McplContentBlock
@@ -122,7 +127,16 @@ def make_publish_handler(
 
         text = extract_text(content)
         if not text:
+            if "threadId" in params:
+                # A targeted publish answers a definite no-post as a result.
+                return {
+                    "delivered": False,
+                    "reason": "no text content to send; nothing was posted",
+                }
             raise ValueError("channels/publish has no text content to send")
+
+        if "threadId" in params:
+            return await publish_targeted(client, peer, kind, text, params)
 
         kwargs: dict[str, Any] = {}
         reply_to_id = params.get("replyToMessageId")
@@ -136,6 +150,122 @@ def make_publish_handler(
         return {"delivered": True, "messageId": str(sent.id)}
 
     return handle_publish
+
+
+def publish_frame_handler(handle_publish):
+    """Wrap a channels/publish handler for frame-aware dispatch.
+
+    MCPL RFC-011: a publish carrying `threadId` must be a Request, so where it
+    landed can be answered; a Notification naming a place is dropped, never
+    posted. A Notification without it keeps the legacy behavior.
+    """
+
+    async def handle(params: ChannelsPublishParams, is_request: bool) -> Any:
+        if not is_request and "threadId" in params:
+            log.warning(
+                "channels/publish Notification carrying threadId dropped: a targeted publish "
+                "must be a Request (MCPL RFC-011)"
+            )
+            return None
+        return await handle_publish(params)
+
+    return handle
+
+
+# A topic id in exactly the form this server sends one: incoming `threadId`
+# and the echo are both `str(int)`. `str.isdigit()` and `int()` are looser.
+# They read "01" and "١" as topic 1, General, which is refused below as "1",
+# and "05" as topic 5, whose echo "5" the host can't match; and `int()`
+# raises on "¹", which `isdigit()` passes. `[0-9]`, unlike `\d`, is ASCII.
+_TOPIC_ID = re.compile(r"[1-9][0-9]*")
+
+
+async def publish_targeted(
+    client: TelegramClient,
+    peer: Any,
+    kind: str,
+    text: str,
+    params: ChannelsPublishParams,
+) -> ChannelsPublishResult:
+    """A channels/publish naming its place (MCPL RFC-011 `threadId`).
+
+    A forum topic id posts exactly into that topic; None posts in the chat
+    itself (a forum's General). It lands there or fails with nothing posted,
+    as `{"delivered": False, "reason": ...}` with no message id, and the
+    result echoes where Telegram's own answer says it landed.
+    """
+    target = params.get("threadId")
+
+    def refuse(reason: str) -> ChannelsPublishResult:
+        log.info("channels/publish refused target %r: %s", target, reason)
+        return {"delivered": False, "reason": reason}
+
+    if target is not None and not (isinstance(target, str) and _TOPIC_ID.fullmatch(target)):
+        return refuse(
+            f"invalid threadId {target!r}: expected a forum topic id (ASCII digits, no leading"
+            " zero), or null for the chat itself"
+        )
+    if target == "1":
+        # Topic 1 is a forum's General: the chat itself, which is null.
+        return refuse("topic 1 is General, the chat itself: publish with threadId null")
+    if params.get("replyToMessageId"):
+        # The replied-to message's own topic would decide where the post
+        # lands, whatever threadId says.
+        return refuse("replyToMessageId can't be combined with threadId; nothing was posted")
+
+    forum = kind == "supergroup" and bool(getattr(peer, "forum", False))
+    kwargs: dict[str, Any] = {}
+    if target is not None:
+        if not forum:
+            return refuse(
+                f"this chat has no forum topics (thread {target} requested); nothing was posted"
+            )
+        topic_id = int(target)
+        try:
+            found = await client(
+                functions.messages.GetForumTopicsByIDRequest(peer=peer, topics=[topic_id])
+            )
+        except Exception as err:  # noqa: BLE001 — any failure means we can't confirm
+            return refuse(
+                f"could not confirm topic {target} in this forum ({err}); nothing was posted"
+            )
+        topic = next(
+            (t for t in getattr(found, "topics", []) if getattr(t, "id", None) == topic_id), None
+        )
+        if topic is None or isinstance(topic, types.ForumTopicDeleted):
+            return refuse(f"no topic {target} in this forum; nothing was posted")
+        kwargs["reply_to"] = topic_id
+
+    try:
+        sent = await client.send_message(peer, text, **kwargs)
+    except RPCError as err:
+        # Telegram's own refusal of the request (400/403: a closed topic, no
+        # rights to post) posted nothing. Anything else stays an error, which
+        # the host treats as unconfirmed.
+        if getattr(err, "code", None) in (400, 403):
+            return refuse(f"Telegram refused the post: {err.__class__.__name__}")
+        raise
+
+    result: ChannelsPublishResult = {"delivered": True, "messageId": str(sent.id)}
+    landed = _landed_topic(sent)
+    if landed is not _UNKNOWN:
+        result["threadId"] = landed
+    return result
+
+
+_UNKNOWN = object()
+
+
+def _landed_topic(sent: Any) -> Any:
+    """Where Telegram says a sent message landed: its forum topic id, None
+    for the chat itself, or _UNKNOWN when its reply header can't tell."""
+    header = getattr(sent, "reply_to", None)
+    if header is None:
+        return None
+    if getattr(header, "forum_topic", False):
+        top = getattr(header, "reply_to_top_id", None) or getattr(header, "reply_to_msg_id", None)
+        return str(top) if top is not None else _UNKNOWN
+    return _UNKNOWN
 
 
 # ---------------------------------------------------------------------------

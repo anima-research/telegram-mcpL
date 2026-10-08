@@ -256,3 +256,29 @@ def test_account_label_threads_through_to_id_and_metadata():
     assert desc["id"] == "telegram:workacct:dm:42"
     assert desc["metadata"]["account"] == "workacct"
     assert desc["address"]["account"] == "workacct"
+
+
+# ---------------------------------------------------------------------------
+# MCPL RFC-011: where a channels/publish lands
+# ---------------------------------------------------------------------------
+
+
+def test_forum_supergroup_declares_exact_publish_target():
+    chan = make_channel(2001, broadcast=False, megagroup=True, forum=True)
+    desc = entity_to_descriptor(chan, account_label="default")
+    assert desc is not None
+    assert desc["capabilities"] == {"publish": {"target": "exact"}}
+
+
+def test_every_other_chat_declares_root_publish_target():
+    entities = [
+        make_user(42),
+        make_user(99, first_name="Me"),  # Saved Messages
+        make_chat(1001),
+        make_channel(2002, broadcast=False, megagroup=True),  # no forum
+        make_channel(3001, broadcast=True, megagroup=False, creator=True),
+    ]
+    for entity in entities:
+        desc = entity_to_descriptor(entity, account_label="default", self_id=99)
+        assert desc is not None
+        assert desc["capabilities"] == {"publish": {"target": "root"}}, desc["id"]
