@@ -114,6 +114,15 @@ async def test_null_posts_in_the_chat_itself_and_echoes_null():
         ({}, FORUM, "0", "invalid threadId"),
         ({}, FORUM, "", "invalid threadId"),
         ({}, FORUM, 42, "invalid threadId"),
+        # Topic ids not in the form this server sends. Where int() reads one
+        # as a topic, the forum holds that topic, so only the check stands
+        # between "01" or Arabic-Indic one and General (topic 1), and between
+        # "05" and topic 5 with an echo of "5". Superscript one passes
+        # isdigit() but makes int() raise.
+        ({"topics": [SimpleNamespace(id=1)]}, FORUM, "01", "invalid threadId"),
+        ({"topics": [SimpleNamespace(id=1)]}, FORUM, "\u0661", "invalid threadId"),
+        ({"topics": [SimpleNamespace(id=5)]}, FORUM, "05", "invalid threadId"),
+        ({}, FORUM, "\u00b9", "invalid threadId"),
     ],
 )
 async def test_targets_that_cannot_be_honored_post_nothing(client_kwargs, peer, thread_id, reason):

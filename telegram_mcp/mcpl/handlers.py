@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from telethon import TelegramClient
@@ -128,7 +129,10 @@ def make_publish_handler(
         if not text:
             if "threadId" in params:
                 # A targeted publish answers a definite no-post as a result.
-                return {"delivered": False, "reason": "no text content to send; nothing was posted"}
+                return {
+                    "delivered": False,
+                    "reason": "no text content to send; nothing was posted",
+                }
             raise ValueError("channels/publish has no text content to send")
 
         if "threadId" in params:
@@ -168,6 +172,14 @@ def publish_frame_handler(handle_publish):
     return handle
 
 
+# A topic id in exactly the form this server sends one: incoming `threadId`
+# and the echo are both `str(int)`. `str.isdigit()` and `int()` are looser.
+# They read "01" and "١" as topic 1, General, which is refused below as "1",
+# and "05" as topic 5, whose echo "5" the host can't match; and `int()`
+# raises on "¹", which `isdigit()` passes. `[0-9]`, unlike `\d`, is ASCII.
+_TOPIC_ID = re.compile(r"[1-9][0-9]*")
+
+
 async def publish_targeted(
     client: TelegramClient,
     peer: Any,
@@ -188,11 +200,10 @@ async def publish_targeted(
         log.info("channels/publish refused target %r: %s", target, reason)
         return {"delivered": False, "reason": reason}
 
-    if target is not None and not (
-        isinstance(target, str) and target.isdigit() and int(target) > 0
-    ):
+    if target is not None and not (isinstance(target, str) and _TOPIC_ID.fullmatch(target)):
         return refuse(
-            f"invalid threadId {target!r}: expected a forum topic id, or null for the chat itself"
+            f"invalid threadId {target!r}: expected a forum topic id (ASCII digits, no leading"
+            " zero), or null for the chat itself"
         )
     if target == "1":
         # Topic 1 is a forum's General: the chat itself, which is null.
