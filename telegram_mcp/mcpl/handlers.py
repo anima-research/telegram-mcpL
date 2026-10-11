@@ -258,13 +258,14 @@ async def publish_targeted(
     """A channels/publish naming its place (MCPL RFC-011 `threadId`), whose
     target has the right form and whose chat was reached.
 
-    A forum topic id posts exactly into that topic, on a chat the host holds
-    as `exact` and that is a forum now; None posts in the chat itself (a
-    forum's General). Anything else is refused with nothing posted, as
-    `{"delivered": False, "reason": ...}` with no message id. Once the send
-    is dispatched, Telegram's own refusal (400/403) is a refusal too, and any
-    other error stays an error, which the host treats as unconfirmed. The
-    result echoes where Telegram's own answer says the post landed.
+    A forum topic id posts exactly into that topic, on a chat that is a forum
+    now, unless the host was last told the chat is `root`; None posts in the
+    chat itself (a forum's General). Anything else is refused with nothing
+    posted, as `{"delivered": False, "reason": ...}` with no message id. Once
+    the send is dispatched, Telegram's own refusal (400/403) is a refusal
+    too, and any other error stays an error, which the host treats as
+    unconfirmed. The result echoes where Telegram's own answer says the post
+    landed.
     """
     target = params.get("threadId")
     kwargs: dict[str, Any] = {}
