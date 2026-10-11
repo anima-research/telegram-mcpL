@@ -80,8 +80,10 @@ class ChannelDescriptor(TypedDict, total=False):
     direction: Literal["outbound", "inbound", "bidirectional"]
     address: dict[str, Any]
     metadata: dict[str, Any]
-    # Per-channel capabilities (Section 14.2), e.g. RFC-011's
-    # {"publish": {"target": "exact" | "root"}}.
+    # Per-channel capabilities. RFC-011 §3 adds the `publish` member,
+    # {"publish": {"target": "exact" | "root"}}, to the descriptor's
+    # capabilities object, which mcpl-core-ts types (SPEC §14.2 doesn't show
+    # the object yet).
     capabilities: dict[str, Any]
 
 

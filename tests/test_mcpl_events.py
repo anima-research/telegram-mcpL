@@ -493,12 +493,10 @@ async def test_chat_action_self_joined_emits_added():
     assert payload["added"][0]["id"] == "telegram:default:group:1001"
 
 
-@pytest.mark.asyncio
-async def test_supergroup_forum_topic_emits_threadId():
-    # Build a supergroup channel
+def _forum_chat():
     from telethon.tl.types import Channel as TelChannel
 
-    chat = TelChannel(
+    return TelChannel(
         id=1000,
         title="Forum",
         photo=None,
@@ -541,6 +539,11 @@ async def test_supergroup_forum_topic_emits_threadId():
         level=None,
         subscription_until_date=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_supergroup_forum_topic_emits_threadId():
+    chat = _forum_chat()
     sender = make_user(42, first="Alice")
     msg = FakeMessage(
         id=100,
@@ -560,6 +563,28 @@ async def test_supergroup_forum_topic_emits_threadId():
     assert out is not None
     assert out["threadId"] == "7"
     assert out["channelId"] == "telegram:default:supergroup:1000"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply_to, thread_id",
+    [
+        # A reply inside topic 7 names the topic, not the replied message.
+        (SimpleNamespace(reply_to_msg_id=50, reply_to_top_id=7, forum_topic=True), "7"),
+        # General, topic 1, is the chat itself: no threadId, as a publish
+        # names it with null.
+        (SimpleNamespace(reply_to_msg_id=1, reply_to_top_id=None, forum_topic=True), None),
+        (SimpleNamespace(reply_to_msg_id=50, reply_to_top_id=1, forum_topic=True), None),
+    ],
+)
+async def test_supergroup_thread_id_reads_the_header_as_the_echo_does(reply_to, thread_id):
+    msg = FakeMessage(id=100, text="hello", reply_to=reply_to)
+    event = FakeEvent(msg, _forum_chat(), make_user(42, first="Alice"))
+    out = await build_incoming_message(
+        event, account_label="default", self_id=99, self_username=None
+    )
+    assert out is not None
+    assert out.get("threadId") == thread_id
 
 
 # ---------------------------------------------------------------------------

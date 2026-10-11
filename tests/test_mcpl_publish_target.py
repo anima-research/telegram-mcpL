@@ -11,23 +11,38 @@ Platform boundary: Telethon's client is a stub here. Telegram's own answers
 are modeled, not observed.
 """
 
+import logging
 from types import SimpleNamespace
 
 import pytest
 from telethon.errors import RPCError
 from telethon.tl import types
 
-from telegram_mcp.mcpl.channels import entity_to_descriptor, publish_declarations
+from telegram_mcp.mcpl.channels import entity_to_descriptor, forum_topic_of, publish_declarations
 from telegram_mcp.mcpl.events import redeclare_publish_target
-from telegram_mcp.mcpl.handlers import make_publish_handler, publish_frame_handler
+from telegram_mcp.mcpl.handlers import (
+    make_list_handler,
+    make_open_handler,
+    make_publish_handler,
+    publish_frame_handler,
+)
 from telegram_mcp.mcpl.policy import PolicyState
 from telegram_mcp.mcpl.ready import make_on_ready
 from tests.test_mcpl_channels import make_channel
 
 
+@pytest.fixture(autouse=True)
+def fresh_declarations():
+    # The store is process-wide: no test sees another's records, even when
+    # one fails partway.
+    publish_declarations.reset()
+    yield
+    publish_declarations.reset()
+
+
 class Client:
     """A Telethon stand-in: send_message records and answers like Telegram
-    (a reply header naming the topic for a topic post), and calling the
+    (its own reply header naming the topic for a topic post), and calling the
     client runs a forum-topics lookup."""
 
     def __init__(self, *, topics=None, lookup_error=None, send_error=None, header=...):
@@ -45,9 +60,7 @@ class Client:
         if self._header is not ...:
             header = self._header
         elif "reply_to" in kwargs:
-            header = SimpleNamespace(
-                forum_topic=True, reply_to_msg_id=kwargs["reply_to"], reply_to_top_id=None
-            )
+            header = types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=kwargs["reply_to"])
         else:
             header = None
         return SimpleNamespace(id=999, reply_to=header)
@@ -158,13 +171,62 @@ async def test_telegrams_refusal_is_a_definite_failure_and_other_errors_stay_err
 
 
 @pytest.mark.asyncio
-async def test_a_reply_header_that_cannot_tell_carries_no_echo():
+async def test_a_post_telegram_reports_outside_any_topic_is_echoed_as_the_chat_itself():
+    # Telegram's own header, read as incoming threadId is: a reply that isn't
+    # in a topic is in the chat itself. The host compares it with "42".
     client = Client(
         topics=[SimpleNamespace(id=42)],
-        header=SimpleNamespace(forum_topic=False, reply_to_msg_id=42),
+        header=types.MessageReplyHeader(forum_topic=False, reply_to_msg_id=42),
+    )
+    result = await handler(client, FORUM)(params(threadId="42"))
+    assert result == {"delivered": True, "messageId": "999", "threadId": None}
+
+
+@pytest.mark.asyncio
+async def test_a_header_telethon_rebuilt_from_the_request_carries_no_echo():
+    # On Telegram's short answer, Telethon builds the sent message from the
+    # request, so its header is the InputReplyToMessage we sent: no report of
+    # where the post landed.
+    client = Client(
+        topics=[SimpleNamespace(id=42)],
+        header=types.InputReplyToMessage(reply_to_msg_id=42),
     )
     result = await handler(client, FORUM)(params(threadId="42"))
     assert result == {"delivered": True, "messageId": "999"}
+
+
+@pytest.mark.asyncio
+async def test_a_reply_inside_a_topic_echoes_the_topic_not_the_replied_message():
+    client = Client(
+        topics=[SimpleNamespace(id=42)],
+        header=types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=77, reply_to_top_id=42),
+    )
+    result = await handler(client, FORUM)(params(threadId="42"))
+    assert result["threadId"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_a_post_telegram_places_in_general_echoes_the_chat_itself():
+    # General is topic 1, which is the chat itself: null, as a host asked.
+    client = Client(header=types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=1))
+    result = await handler(client, FORUM)(params(threadId=None))
+    assert result == {"delivered": True, "messageId": "999", "threadId": None}
+
+
+@pytest.mark.parametrize(
+    "header, topic",
+    [
+        (None, None),
+        (types.MessageReplyHeader(forum_topic=False, reply_to_msg_id=50), None),
+        (types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=42), "42"),
+        (types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=77, reply_to_top_id=42), "42"),
+        (types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=1), None),
+        (types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=77, reply_to_top_id=1), None),
+        (types.MessageReplyHeader(forum_topic=True), None),
+    ],
+)
+def test_one_reading_of_a_reply_header_names_the_topic(header, topic):
+    assert forum_topic_of(header) == topic
 
 
 @pytest.mark.asyncio
@@ -172,7 +234,7 @@ async def test_a_post_that_landed_elsewhere_is_echoed_as_it_landed():
     # The echo is Telegram's answer, not the request: the host compares them.
     client = Client(
         topics=[SimpleNamespace(id=42)],
-        header=SimpleNamespace(forum_topic=True, reply_to_msg_id=43, reply_to_top_id=None),
+        header=types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=43),
     )
     result = await handler(client, FORUM)(params(threadId="42"))
     assert result["threadId"] == "43"
@@ -231,7 +293,6 @@ class Transport:
 
 @pytest.mark.asyncio
 async def test_registration_records_what_each_chat_declared():
-    publish_declarations.reset()
     plain = make_channel(2001, broadcast=False, megagroup=True)
 
     async def enumerate_channels(client, label):
@@ -249,14 +310,15 @@ async def test_registration_records_what_each_chat_declared():
     )
     await on_ready(transport)
     assert transport.sent[0][0] == "channels/register"
+    # Recorded as declared: the same chat reads as current, and a forum
+    # turned on since reads as a change.
+    assert not publish_declarations.is_stale(entity_to_descriptor(plain, account_label="default"))
     forum_now = make_channel(2001, broadcast=False, megagroup=True, forum=True)
     assert publish_declarations.is_stale(entity_to_descriptor(forum_now, account_label="default"))
-    publish_declarations.reset()
 
 
 @pytest.mark.asyncio
 async def test_a_chat_that_turns_its_forum_on_is_redeclared_exact_before_its_messages():
-    publish_declarations.reset()
     registered = entity_to_descriptor(
         make_channel(2001, broadcast=False, megagroup=True), account_label="default"
     )
@@ -285,12 +347,10 @@ async def test_a_chat_that_turns_its_forum_on_is_redeclared_exact_before_its_mes
         is True
     )
     assert transport.sent[-1][1]["updated"][0]["capabilities"] == {"publish": {"target": "root"}}
-    publish_declarations.reset()
 
 
 @pytest.mark.asyncio
 async def test_redeclaration_needs_the_chat_registered_and_the_register_grant():
-    publish_declarations.reset()
     transport = Transport()
     forum_now = make_channel(2001, broadcast=False, megagroup=True, forum=True)
     # Never registered: nothing to correct.
@@ -320,7 +380,6 @@ async def test_redeclaration_needs_the_chat_registered_and_the_register_grant():
         is False
     )
     assert transport.sent == []
-    publish_declarations.reset()
 
 
 @pytest.mark.asyncio
@@ -329,7 +388,6 @@ async def test_a_topic_message_is_forwarded_only_after_its_chat_is_redeclared(mo
     from telegram_mcp.mcpl.events import attach_event_handlers, reset_attached_clients
 
     reset_attached_clients()
-    publish_declarations.reset()
     publish_declarations.record(
         [
             entity_to_descriptor(
@@ -372,5 +430,336 @@ async def test_a_topic_message_is_forwarded_only_after_its_chat_is_redeclared(mo
     await client.handlers["NewMessage"](SimpleNamespace(out=False, get_chat=get_chat))
     assert [m for m, _ in transport.sent] == ["channels/changed", "channels/incoming"]
     assert transport.sent[0][1]["updated"][0]["capabilities"] == {"publish": {"target": "exact"}}
-    publish_declarations.reset()
     reset_attached_clients()
+
+
+# ---------------------------------------------------------------------------
+# The declaration the host holds decides; every failure before the send is a
+# refusal; every descriptor sent is recorded
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_chat_last_declared_root_refuses_a_topic_even_with_its_forum_on():
+    # The forum came on, but the host hasn't been told: it holds root.
+    publish_declarations.record(
+        [
+            entity_to_descriptor(
+                make_channel(2001, broadcast=False, megagroup=True), account_label="default"
+            )
+        ]
+    )
+    client = Client(topics=[SimpleNamespace(id=42)])
+    result = await handler(client, FORUM)(params(threadId="42"))
+    assert result["delivered"] is False and "declared root" in result["reason"]
+    assert client.sent == [] and client.lookups == []
+    # null is honored on a root chat.
+    result = await handler(client, FORUM)(params(threadId=None))
+    assert result == {"delivered": True, "messageId": "999", "threadId": None}
+
+
+@pytest.mark.asyncio
+async def test_failures_before_the_send_are_refusals_not_errors():
+    async def ensure(c):
+        pass
+
+    async def unresolvable(peer_id, client_):
+        raise ValueError("Could not find the input entity for PeerChannel(channel_id=2001)")
+
+    client = Client(topics=[SimpleNamespace(id=42)])
+    publish = make_publish_handler(
+        {"default": client}, resolve_entity_fn=unresolvable, ensure_connected_fn=ensure
+    )
+    result = await publish(params(threadId="42"))
+    assert result["delivered"] is False and "could not reach this chat" in result["reason"]
+    assert "messageId" not in result and client.sent == []
+
+    result = await publish(params("telegram:other:supergroup:2001", threadId="42"))
+    assert result["delivered"] is False and "unknown account" in result["reason"]
+
+    result = await publish(params("not-a-telegram-id", threadId=None))
+    assert result["delivered"] is False and "could not reach this chat" in result["reason"]
+
+    # An invalid target is refused before the chat is resolved at all.
+    resolved = []
+
+    async def resolve(peer_id, client_):
+        resolved.append(peer_id)
+        return FORUM
+
+    publish = make_publish_handler(
+        {"default": client}, resolve_entity_fn=resolve, ensure_connected_fn=ensure
+    )
+    result = await publish(params(threadId="abc"))
+    assert result["delivered"] is False and "invalid threadId" in result["reason"]
+    assert resolved == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_target_is_named_bounded():
+    client = Client()
+    huge = "x" * 100_000
+    result = await handler(client, FORUM)(params(threadId=huge))
+    assert result["delivered"] is False and len(result["reason"]) < 300
+    # A topic id is a message id: more than ten digits is no topic id.
+    result = await handler(client, FORUM)(params(threadId="12345678901"))
+    assert result["delivered"] is False and "invalid threadId" in result["reason"]
+    assert client.sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_targeted_notification_is_logged_where_an_operator_looks(caplog):
+    client = Client()
+    frame = publish_frame_handler(handler(client, PLAIN))
+    with caplog.at_level(logging.ERROR, logger="telegram_mcp.mcpl"):
+        await frame(params("telegram:default:dm:42", threadId=None), False)
+    assert client.sent == []
+    assert any(
+        r.levelno >= logging.ERROR and "telegram:default:dm:42" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_list_answer_and_the_open_answer_carry_what_the_host_holds(monkeypatch):
+    import telegram_mcp.mcpl.handlers as handlers_mod
+
+    plain = entity_to_descriptor(
+        make_channel(2001, broadcast=False, megagroup=True), account_label="default"
+    )
+
+    async def enumerate_channels(client, label):
+        return [plain]
+
+    monkeypatch.setattr(handlers_mod, "enumerate_channels", enumerate_channels)
+    listed = await make_list_handler({"default": object()})({})
+    assert listed == {"channels": [plain]}
+    # Recorded: a forum turned on later is a change to re-declare.
+    forum_now = entity_to_descriptor(
+        make_channel(2001, broadcast=False, megagroup=True, forum=True), account_label="default"
+    )
+    assert publish_declarations.is_stale(forum_now)
+
+    opened = await make_open_handler()({"type": "telegram", "address": {"id": plain["id"]}})
+    assert opened["channel"]["capabilities"] == {"publish": {"target": "root"}}
+    # A channel never declared gets no declaration in the answer.
+    opened = await make_open_handler()(
+        {"type": "telegram", "address": {"id": "telegram:default:dm:7"}}
+    )
+    assert "capabilities" not in opened["channel"]
+
+
+# ---------------------------------------------------------------------------
+# Re-declaration through the real handlers
+# ---------------------------------------------------------------------------
+
+
+class HandlerClient:
+    """Captures the handlers attach_event_handlers registers, by event:
+    NewMessage, ChatAction, and Raw (Telegram's updateChannel)."""
+
+    def __init__(self, entity=None):
+        self.handlers: dict = {}
+        self.entity = entity
+        self.fetched: list = []
+
+    async def get_me(self):
+        return SimpleNamespace(id=99, username="me")
+
+    async def get_entity(self, peer):
+        self.fetched.append(peer)
+        return self.entity
+
+    def on(self, event_filter):
+        def decorator(fn):
+            name = getattr(event_filter, "__name__", None) or type(event_filter).__name__
+            self.handlers[name] = fn
+            return fn
+
+        return decorator
+
+
+async def attach(monkeypatch, client, transport, payload=None):
+    import telegram_mcp.mcpl.events as events_mod
+    from telegram_mcp.mcpl.events import attach_event_handlers, reset_attached_clients
+
+    reset_attached_clients()
+    if payload is not None:
+
+        async def incoming(event, **kwargs):
+            return payload
+
+        monkeypatch.setattr(events_mod, "build_incoming_message", incoming)
+    await attach_event_handlers(client, account_label="default", transport=transport)
+    reset_attached_clients()
+
+
+TOPIC_MESSAGE = {
+    "channelId": "telegram:default:supergroup:2001",
+    "messageId": "7",
+    "threadId": "42",
+    "content": [],
+}
+
+
+def declare(**channel):
+    descriptor = entity_to_descriptor(
+        make_channel(2001, broadcast=False, megagroup=True, **channel), account_label="default"
+    )
+    publish_declarations.record([descriptor])
+    return descriptor
+
+
+@pytest.mark.asyncio
+async def test_telegrams_channel_update_redeclares_a_forum_turned_off(monkeypatch):
+    declare(forum=True)
+    client = HandlerClient(entity=make_channel(2001, broadcast=False, megagroup=True))
+    transport = Transport()
+    await attach(monkeypatch, client, transport)
+
+    await client.handlers["Raw"](types.UpdateChannel(channel_id=2001))
+    assert [m for m, _ in transport.sent] == ["channels/changed"]
+    assert transport.sent[0][1]["updated"][0]["capabilities"] == {"publish": {"target": "root"}}
+    assert publish_declarations.target_of("telegram:default:supergroup:2001") == "root"
+
+    # Again, with nothing changed: nothing to say.
+    await client.handlers["Raw"](types.UpdateChannel(channel_id=2001))
+    assert len(transport.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_channel_update_for_a_chat_the_host_holds_nothing_for_is_ignored(monkeypatch):
+    client = HandlerClient(entity=make_channel(3001, broadcast=False, megagroup=True, forum=True))
+    transport = Transport()
+    await attach(monkeypatch, client, transport)
+    await client.handlers["Raw"](types.UpdateChannel(channel_id=3001))
+    assert transport.sent == [] and client.fetched == []
+
+
+@pytest.mark.asyncio
+async def test_a_topic_message_proves_its_chat_a_forum_whatever_a_cached_chat_says(monkeypatch):
+    declare()  # registered root
+    client = HandlerClient()
+    transport = Transport()
+    await attach(monkeypatch, client, transport, payload=TOPIC_MESSAGE)
+
+    async def stale_chat():
+        return make_channel(2001, broadcast=False, megagroup=True)  # forum not yet seen
+
+    await client.handlers["NewMessage"](SimpleNamespace(out=False, get_chat=stale_chat))
+    assert [m for m, _ in transport.sent] == ["channels/changed", "channels/incoming"]
+    assert transport.sent[0][1]["updated"][0]["capabilities"] == {"publish": {"target": "exact"}}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_redeclaration_never_costs_the_message(monkeypatch):
+    declare()
+    client = HandlerClient()
+    transport = Transport()
+    await attach(monkeypatch, client, transport, payload=TOPIC_MESSAGE)
+
+    async def unreachable():
+        raise ConnectionError("lost the chat")
+
+    await client.handlers["NewMessage"](SimpleNamespace(out=False, get_chat=unreachable))
+    assert [m for m, _ in transport.sent] == ["channels/incoming"]
+    assert transport.sent[0][1]["messages"][0]["threadId"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_a_join_records_what_it_declared(monkeypatch):
+    import telegram_mcp.mcpl.events as events_mod
+
+    joined = entity_to_descriptor(
+        make_channel(2001, broadcast=False, megagroup=True, forum=True), account_label="default"
+    )
+
+    async def join_payload(event, **kwargs):
+        return {"added": [joined]}
+
+    monkeypatch.setattr(events_mod, "_build_chat_action_payload", join_payload)
+    client = HandlerClient()
+    transport = Transport()
+    await attach(monkeypatch, client, transport)
+    await client.handlers["ChatAction"](SimpleNamespace())
+    assert [m for m, _ in transport.sent] == ["channels/changed"]
+    assert publish_declarations.target_of(joined["id"]) == "exact"
+
+
+@pytest.mark.asyncio
+async def test_a_new_host_session_starts_with_no_records():
+    publish_declarations.record(
+        [
+            entity_to_descriptor(
+                make_channel(9999, broadcast=False, megagroup=True), account_label="default"
+            )
+        ]
+    )
+    plain = make_channel(2001, broadcast=False, megagroup=True)
+
+    async def enumerate_channels(client, label):
+        return [entity_to_descriptor(plain, account_label=label)]
+
+    async def attach_handlers(client, **kwargs):
+        pass
+
+    on_ready = make_on_ready(
+        {"default": object()},
+        policy=PolicyState(),
+        enumerate_channels=enumerate_channels,
+        attach_event_handlers=attach_handlers,
+    )
+    await on_ready(Transport())
+    assert publish_declarations.target_of("telegram:default:supergroup:9999") is None
+    assert publish_declarations.target_of("telegram:default:supergroup:2001") == "root"
+
+
+@pytest.mark.asyncio
+async def test_the_runners_dispatcher_takes_a_targeted_publish_only_as_a_request(monkeypatch):
+    import telegram_mcp.runner as runner
+
+    client = Client()
+
+    async def resolve(peer_id, client_):
+        return PLAIN
+
+    async def ensure(c):
+        pass
+
+    monkeypatch.setattr(runner, "clients", {"default": client})
+    monkeypatch.setattr(runner, "resolve_entity", resolve)
+    monkeypatch.setattr(runner, "ensure_connected", ensure)
+    dispatcher = runner._build_dispatcher(PolicyState())
+
+    class Wire:
+        def __init__(self):
+            self.responses: list = []
+
+        async def send_response(self, msg_id, result):
+            self.responses.append((msg_id, result))
+
+        async def send_error(self, msg_id, code, message, data=None):
+            self.responses.append((msg_id, {"error": code, "message": message}))
+
+    wire = Wire()
+    targeted = params("telegram:default:dm:42", threadId=None)
+    await dispatcher.handle_inbound(
+        {"jsonrpc": "2.0", "method": "channels/publish", "params": targeted}, wire
+    )
+    assert client.sent == [] and wire.responses == []
+
+    await dispatcher.handle_inbound(
+        {
+            "jsonrpc": "2.0",
+            "method": "channels/publish",
+            "params": params("telegram:default:dm:42"),
+        },
+        wire,
+    )
+    assert len(client.sent) == 1 and wire.responses == []
+
+    await dispatcher.handle_inbound(
+        {"jsonrpc": "2.0", "id": 5, "method": "channels/publish", "params": targeted}, wire
+    )
+    assert len(client.sent) == 2
+    assert wire.responses == [(5, {"delivered": True, "messageId": "999", "threadId": None})]

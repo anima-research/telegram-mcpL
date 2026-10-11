@@ -54,6 +54,9 @@ def make_on_ready(
     """
 
     async def on_ready(transport: McplTransport) -> None:
+        # A new host session holds no declarations yet: what the store records
+        # from here on is exactly what this session is told (RFC-011 §3).
+        publish_declarations.reset()
         if host_speaks_0_5(transport.host_capabilities):
             answered = await policy.wait_ready(policy_wait_seconds)
             if not answered:

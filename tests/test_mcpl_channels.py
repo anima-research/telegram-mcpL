@@ -15,6 +15,7 @@ from telethon.tl.types import (
 from telegram_mcp.mcpl.channels import (
     channel_id_for,
     entity_to_descriptor,
+    enumerate_channels,
 )
 
 
@@ -282,3 +283,18 @@ def test_every_other_chat_declares_root_publish_target():
         desc = entity_to_descriptor(entity, account_label="default", self_id=99)
         assert desc is not None
         assert desc["capabilities"] == {"publish": {"target": "root"}}, desc["id"]
+
+
+@pytest.mark.asyncio
+async def test_synthesized_saved_messages_declares_root_publish_target():
+    class NoDialogs:
+        async def get_me(self):
+            return SimpleNamespace(id=99)
+
+        async def iter_dialogs(self):
+            return
+            yield  # an async generator with nothing to give
+
+    descriptors = await enumerate_channels(NoDialogs(), "default")
+    assert [d["id"] for d in descriptors] == ["telegram:default:saved"]
+    assert descriptors[0]["capabilities"] == {"publish": {"target": "root"}}

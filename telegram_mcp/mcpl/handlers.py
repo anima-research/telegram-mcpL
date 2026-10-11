@@ -2,10 +2,12 @@
 
   - channels/publish — send agent's content via the right Telethon client.
     Honors MCPL RFC-011 `threadId` (a forum topic id, or None for the chat
-    itself), posting exactly there or failing with nothing posted. Without
-    it, honors a custom `replyToMessageId` extension (not in the base MCPL
-    spec) which also auto-threads into the right forum topic when the
-    original message lived in one.
+    itself): it posts exactly there, or refuses with nothing posted. Once
+    the send is dispatched, an error other than Telegram's own refusal stays
+    an error, which the host treats as unconfirmed. Without `threadId`, it
+    honors a custom `replyToMessageId` extension (not in the base MCPL spec)
+    which also auto-threads into the right forum topic when the original
+    message lived in one.
   - channels/typing — fire a brief typing indicator on the target chat.
   - channels/list — re-enumerate live dialogs and return the current set.
   - channels/open / channels/close — minimal acknowledgements; channel
@@ -23,7 +25,7 @@ from telethon import TelegramClient
 from telethon.errors import RPCError
 from telethon.tl import functions, types
 
-from .channels import enumerate_channels
+from .channels import GENERAL_TOPIC_ID, enumerate_channels, forum_topic_of, publish_declarations
 from .types import ChannelsPublishParams, ChannelsPublishResult, McplContentBlock
 
 log = logging.getLogger("telegram_mcp.mcpl")
@@ -108,6 +110,8 @@ def make_publish_handler(
         channel_id = params.get("channelId")
         if not channel_id:
             raise ValueError("channels/publish missing channelId")
+        if "threadId" in params:
+            return await handle_targeted(channel_id, params)
         content = params.get("content") or []
 
         account_label, kind, peer_id = parse_channel_id(channel_id)
@@ -127,16 +131,7 @@ def make_publish_handler(
 
         text = extract_text(content)
         if not text:
-            if "threadId" in params:
-                # A targeted publish answers a definite no-post as a result.
-                return {
-                    "delivered": False,
-                    "reason": "no text content to send; nothing was posted",
-                }
             raise ValueError("channels/publish has no text content to send")
-
-        if "threadId" in params:
-            return await publish_targeted(client, peer, kind, text, params)
 
         kwargs: dict[str, Any] = {}
         reply_to_id = params.get("replyToMessageId")
@@ -148,6 +143,38 @@ def make_publish_handler(
 
         sent = await client.send_message(peer, text, **kwargs)
         return {"delivered": True, "messageId": str(sent.id)}
+
+    async def handle_targeted(
+        channel_id: str, params: ChannelsPublishParams
+    ) -> ChannelsPublishResult:
+        # RFC-011 §4: a target this server can't honor is refused as a
+        # result, with nothing posted. So the target's form is checked first,
+        # and every failure before the send answers the same way.
+        target = params.get("threadId")
+        refusal = _refuse_target_form(target, params)
+        if refusal is not None:
+            return refusal
+        text = extract_text(params.get("content") or [])
+        if not text:
+            return _refusal(target, "no text content to send; nothing was posted")
+        try:
+            account_label, kind, peer_id = parse_channel_id(channel_id)
+            client = clients.get(account_label)
+            if client is None:
+                return _refusal(
+                    target, f"unknown account {_brief(repr(account_label))}; nothing was posted"
+                )
+            await ensure_connected_fn(client)
+            if kind == "saved":
+                peer: Any = "me"
+            else:
+                assert peer_id is not None  # parse_channel_id guarantees this
+                peer = await resolve_entity_fn(peer_id, client)
+        except Exception as err:  # noqa: BLE001 — nothing was sent
+            return _refusal(
+                target, f"could not reach this chat ({_error_text(err)}); nothing was posted"
+            )
+        return await publish_targeted(client, peer, kind, text, params)
 
     return handle_publish
 
@@ -162,9 +189,12 @@ def publish_frame_handler(handle_publish):
 
     async def handle(params: ChannelsPublishParams, is_request: bool) -> Any:
         if not is_request and "threadId" in params:
-            log.warning(
-                "channels/publish Notification carrying threadId dropped: a targeted publish "
-                "must be a Request (MCPL RFC-011)"
+            # The host broke RFC-011 §4's Request rule and loses this publish,
+            # so say so where an operator looks: the package logs at ERROR.
+            log.error(
+                "channels/publish Notification carrying threadId dropped for %s: a targeted "
+                "publish must be a Request (MCPL RFC-011 §4); nothing was posted",
+                _brief(repr(params.get("channelId")), 120),
             )
             return None
         return await handle_publish(params)
@@ -173,11 +203,49 @@ def publish_frame_handler(handle_publish):
 
 
 # A topic id in exactly the form this server sends one: incoming `threadId`
-# and the echo are both `str(int)`. `str.isdigit()` and `int()` are looser.
-# They read "01" and "١" as topic 1, General, which is refused below as "1",
-# and "05" as topic 5, whose echo "5" the host can't match; and `int()`
-# raises on "¹", which `isdigit()` passes. `[0-9]`, unlike `\d`, is ASCII.
-_TOPIC_ID = re.compile(r"[1-9][0-9]*")
+# and the echo are both `str(int)` of a message id, at most ten digits.
+# `str.isdigit()` and `int()` are looser. They would read "01" and "١" as
+# topic 1, General, and post there, though only the string "1" is refused by
+# name; they would read "05" as topic 5, whose echo "5" the host can't match;
+# and `int()` raises on "¹", which `isdigit()` passes. `[0-9]`, unlike `\d`,
+# is ASCII.
+_TOPIC_ID = re.compile(r"[1-9][0-9]{0,9}")
+
+
+def _brief(text: str, limit: int = 60) -> str:
+    """A host-supplied value or an error, bounded for a log line or a reason:
+    a host can send a target of any size or type."""
+    return text if len(text) <= limit else f"{text[:limit]}… ({len(text)} characters)"
+
+
+def _error_text(err: BaseException) -> str:
+    return _brief(f"{type(err).__name__}: {err}", 120)
+
+
+def _refusal(target: Any, reason: str) -> ChannelsPublishResult:
+    log.info("channels/publish refused target %s: %s", _brief(repr(target)), reason)
+    return {"delivered": False, "reason": reason}
+
+
+def _refuse_target_form(
+    target: Any, params: ChannelsPublishParams
+) -> ChannelsPublishResult | None:
+    """Refuse a `threadId` this server can never honor, before anything else."""
+    if target is not None and not (isinstance(target, str) and _TOPIC_ID.fullmatch(target)):
+        return _refusal(
+            target,
+            f"invalid threadId {_brief(repr(target))}: expected a forum topic id (ASCII digits,"
+            " no leading zero), or null for the chat itself",
+        )
+    if target == str(GENERAL_TOPIC_ID):
+        return _refusal(target, "topic 1 is General, the chat itself: publish with threadId null")
+    if params.get("replyToMessageId"):
+        # The replied-to message's own topic would decide where the post
+        # lands, whatever threadId says.
+        return _refusal(
+            target, "replyToMessageId can't be combined with threadId; nothing was posted"
+        )
+    return None
 
 
 async def publish_targeted(
@@ -187,53 +255,49 @@ async def publish_targeted(
     text: str,
     params: ChannelsPublishParams,
 ) -> ChannelsPublishResult:
-    """A channels/publish naming its place (MCPL RFC-011 `threadId`).
+    """A channels/publish naming its place (MCPL RFC-011 `threadId`), whose
+    target has the right form and whose chat was reached.
 
-    A forum topic id posts exactly into that topic; None posts in the chat
-    itself (a forum's General). It lands there or fails with nothing posted,
-    as `{"delivered": False, "reason": ...}` with no message id, and the
-    result echoes where Telegram's own answer says it landed.
+    A forum topic id posts exactly into that topic, on a chat the host holds
+    as `exact` and that is a forum now; None posts in the chat itself (a
+    forum's General). Anything else is refused with nothing posted, as
+    `{"delivered": False, "reason": ...}` with no message id. Once the send
+    is dispatched, Telegram's own refusal (400/403) is a refusal too, and any
+    other error stays an error, which the host treats as unconfirmed. The
+    result echoes where Telegram's own answer says the post landed.
     """
     target = params.get("threadId")
-
-    def refuse(reason: str) -> ChannelsPublishResult:
-        log.info("channels/publish refused target %r: %s", target, reason)
-        return {"delivered": False, "reason": reason}
-
-    if target is not None and not (isinstance(target, str) and _TOPIC_ID.fullmatch(target)):
-        return refuse(
-            f"invalid threadId {target!r}: expected a forum topic id (ASCII digits, no leading"
-            " zero), or null for the chat itself"
-        )
-    if target == "1":
-        # Topic 1 is a forum's General: the chat itself, which is null.
-        return refuse("topic 1 is General, the chat itself: publish with threadId null")
-    if params.get("replyToMessageId"):
-        # The replied-to message's own topic would decide where the post
-        # lands, whatever threadId says.
-        return refuse("replyToMessageId can't be combined with threadId; nothing was posted")
-
-    forum = kind == "supergroup" and bool(getattr(peer, "forum", False))
     kwargs: dict[str, Any] = {}
     if target is not None:
-        if not forum:
-            return refuse(
-                f"this chat has no forum topics (thread {target} requested); nothing was posted"
+        if publish_declarations.target_of(params["channelId"]) == "root":
+            # The host was told this chat has no threads (RFC-011 §3), even
+            # if its forum has come on since: it hasn't been re-declared.
+            return _refusal(
+                target,
+                f"this chat is declared root, with no threads (thread {target} requested);"
+                " nothing was posted",
+            )
+        if not (kind == "supergroup" and bool(getattr(peer, "forum", False))):
+            return _refusal(
+                target,
+                f"this chat has no forum topics (thread {target} requested); nothing was posted",
             )
         topic_id = int(target)
         try:
             found = await client(
                 functions.messages.GetForumTopicsByIDRequest(peer=peer, topics=[topic_id])
             )
-        except Exception as err:  # noqa: BLE001 — any failure means we can't confirm
-            return refuse(
-                f"could not confirm topic {target} in this forum ({err}); nothing was posted"
+        except Exception as err:  # noqa: BLE001 — unconfirmed, and nothing was sent
+            return _refusal(
+                target,
+                f"could not confirm topic {target} in this forum ({_error_text(err)});"
+                " nothing was posted",
             )
         topic = next(
             (t for t in getattr(found, "topics", []) if getattr(t, "id", None) == topic_id), None
         )
         if topic is None or isinstance(topic, types.ForumTopicDeleted):
-            return refuse(f"no topic {target} in this forum; nothing was posted")
+            return _refusal(target, f"no topic {target} in this forum; nothing was posted")
         kwargs["reply_to"] = topic_id
 
     try:
@@ -243,7 +307,7 @@ async def publish_targeted(
         # rights to post) posted nothing. Anything else stays an error, which
         # the host treats as unconfirmed.
         if getattr(err, "code", None) in (400, 403):
-            return refuse(f"Telegram refused the post: {err.__class__.__name__}")
+            return _refusal(target, f"Telegram refused the post: {err.__class__.__name__}")
         raise
 
     result: ChannelsPublishResult = {"delivered": True, "messageId": str(sent.id)}
@@ -257,15 +321,23 @@ _UNKNOWN = object()
 
 
 def _landed_topic(sent: Any) -> Any:
-    """Where Telegram says a sent message landed: its forum topic id, None
-    for the chat itself, or _UNKNOWN when its reply header can't tell."""
+    """Where Telegram says a sent message landed: a forum topic id, None for
+    the chat itself, or _UNKNOWN when Telegram didn't say.
+
+    Telegram's own answer carries the message's reply header, read exactly as
+    incoming threadId is (forum_topic_of). No header means the message is in
+    the chat itself: Telegram reports it outside any reply, or, on its short
+    answer, the send named none. On that short answer Telethon builds the
+    message from our request, so a header there is the InputReplyToMessage we
+    sent, which reports nothing about where the post landed: no echo, and the
+    host counts the post unconfirmed (RFC-011 §5).
+    """
     header = getattr(sent, "reply_to", None)
     if header is None:
         return None
-    if getattr(header, "forum_topic", False):
-        top = getattr(header, "reply_to_top_id", None) or getattr(header, "reply_to_msg_id", None)
-        return str(top) if top is not None else _UNKNOWN
-    return _UNKNOWN
+    if not isinstance(header, types.MessageReplyHeader):
+        return _UNKNOWN
+    return forum_topic_of(header)
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +355,9 @@ def make_list_handler(clients: dict[str, TelegramClient]):
                 channels.extend(await enumerate_channels(cl, label))
             except Exception:
                 log.exception("channels/list — enumeration failed for %r", label)
+        # The host may keep these descriptors, declarations included, so a
+        # later change to one is re-declared (RFC-011 §3).
+        publish_declarations.record(channels)
         return {"channels": channels}
 
     return handle_list
@@ -300,15 +375,19 @@ def make_open_handler():
         # The spec returns a ChannelDescriptor on success. The host already
         # has it from the original channels/register; echo back what they
         # asked about so the contract is satisfied.
-        return {
-            "channel": {
-                "id": params.get("address", {}).get("id")
-                or f"telegram:{params.get('type', 'unknown')}",
-                "type": params.get("type", "telegram"),
-                "label": "open-acknowledged",
-                "direction": "bidirectional",
-            }
+        channel: dict[str, Any] = {
+            "id": params.get("address", {}).get("id")
+            or f"telegram:{params.get('type', 'unknown')}",
+            "type": params.get("type", "telegram"),
+            "label": "open-acknowledged",
+            "direction": "bidirectional",
         }
+        # A host that keeps this answer keeps the publish target it was last
+        # told for the channel (RFC-011 §3), not a descriptor without one.
+        target = publish_declarations.target_of(channel["id"])
+        if target is not None:
+            channel["capabilities"] = {"publish": {"target": target}}
+        return {"channel": channel}
 
     return handle_open
 

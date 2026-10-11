@@ -118,11 +118,14 @@ def entity_to_descriptor(
     *,
     account_label: str,
     self_id: int | None = None,
+    forum: bool | None = None,
 ) -> ChannelDescriptor | None:
     """Convert a Telethon entity to an MCPL ChannelDescriptor.
 
     Returns None for entities we can't or shouldn't expose (forbidden,
-    empty, unknown kind).
+    empty, unknown kind). `forum` overrides the entity's own forum flag, for
+    a caller holding better evidence than a possibly cached entity (a topic
+    message proves its supergroup is a forum).
     """
     kind = _kind_of(entity)
     if kind is None:
@@ -159,7 +162,8 @@ def entity_to_descriptor(
     if username:
         descriptor["metadata"]["username"] = username
 
-    forum = getattr(entity, "forum", False)
+    if forum is None:
+        forum = bool(getattr(entity, "forum", False))
     if kind == "supergroup" and forum:
         descriptor["metadata"]["forum"] = True
 
@@ -197,12 +201,41 @@ class PublishDeclarations:
         channel_id = descriptor["id"]
         return channel_id in self._targets and self._targets[channel_id] != self._target(descriptor)
 
+    def target_of(self, channel_id: str) -> str | None:
+        """The publish target the host was last told for this chat, or None
+        when it was told none (or nothing about the chat)."""
+        return self._targets.get(channel_id)
+
     def reset(self) -> None:
         self._targets.clear()
 
 
 # One per process, like the event handlers it serves (see events.py).
 publish_declarations = PublishDeclarations()
+
+
+GENERAL_TOPIC_ID = 1
+"""A forum's General topic, which is the chat itself (a publish names it with
+threadId None, never "1")."""
+
+
+def forum_topic_of(header: Any) -> str | None:
+    """The forum topic a Telegram reply header places its message in, in the
+    form this server sends as threadId: the topic's id as a string, or None for
+    the chat itself.
+
+    A message inside a topic carries a header with forum_topic set. Its topic
+    is reply_to_top_id when it replies to another message in the topic, else
+    reply_to_msg_id (the topic's own first message). General (topic 1) is the
+    chat itself. Incoming threadId and the publish echo both read headers
+    through this, so what a host receives is what it can publish to.
+    """
+    if header is None or not getattr(header, "forum_topic", False):
+        return None
+    top = getattr(header, "reply_to_top_id", None) or getattr(header, "reply_to_msg_id", None)
+    if top is None or top == GENERAL_TOPIC_ID:
+        return None
+    return str(top)
 
 
 def publish_capabilities(forum: bool) -> dict[str, Any]:
