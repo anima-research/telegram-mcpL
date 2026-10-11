@@ -23,6 +23,7 @@ from datetime import timezone
 from typing import TYPE_CHECKING, Any
 
 from telethon import TelegramClient, events
+from telethon.errors import RPCError
 from telethon.tl.types import (
     Channel,
     Chat,
@@ -385,6 +386,7 @@ async def attach_event_handlers(
 
     Currently:
       - NewMessage → channels/incoming
+      - UpdateChannel → channels/changed (a registered chat's re-declaration)
       - ChatAction → channels/changed (joins, leaves, kicks affecting us)
 
     `policy` (MCPL 0.5, §5.4): when given, every push is checked against the
@@ -456,7 +458,7 @@ async def attach_event_handlers(
             log.exception("Failed to push NewMessage event")
 
     @client.on(events.Raw(UpdateChannel))
-    async def on_channel_update(update):  # pragma: no cover — real-Telegram path
+    async def on_channel_update(update):
         # Telegram's notice that a channel's info changed and must be
         # refetched. A supergroup that turned its forum on or off is
         # re-declared here, whether or not a topic message follows (RFC-011
@@ -472,6 +474,11 @@ async def attach_event_handlers(
                 transport=transport,
                 policy=policy,
             )
+        except RPCError as err:
+            # Telegram refused the refetch. An account that left the
+            # supergroup, or was removed from it, gets this notice too, and
+            # may no longer read it.
+            log.warning("Could not refetch changed channel %s: %s", channel_id, err)
         except Exception:
             log.exception("Failed to re-declare changed channel %s", channel_id)
 

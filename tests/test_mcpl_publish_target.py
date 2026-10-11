@@ -568,6 +568,8 @@ class HandlerClient:
 
     async def get_entity(self, peer):
         self.fetched.append(peer)
+        if isinstance(self.entity, Exception):
+            raise self.entity
         return self.entity
 
     def on(self, event_filter):
@@ -634,6 +636,26 @@ async def test_a_channel_update_for_a_chat_the_host_holds_nothing_for_is_ignored
     await attach(monkeypatch, client, transport)
     await client.handlers["Raw"](types.UpdateChannel(channel_id=3001))
     assert transport.sent == [] and client.fetched == []
+
+
+@pytest.mark.asyncio
+async def test_a_channel_update_telegram_wont_let_us_refetch_is_a_warning(monkeypatch, caplog):
+    # An account that left a supergroup, or was removed from it, gets
+    # updateChannel too, and its refetch may be refused: a warning naming the
+    # chat, without a traceback.
+    declare(forum=True)
+    refused = RPCError(request=None, message="CHANNEL_PRIVATE", code=400)
+    client = HandlerClient(entity=refused)
+    transport = Transport()
+    await attach(monkeypatch, client, transport)
+    with caplog.at_level(logging.WARNING, logger="telegram_mcp.mcpl"):
+        await client.handlers["Raw"](types.UpdateChannel(channel_id=2001))
+    assert transport.sent == []
+    assert publish_declarations.target_of("telegram:default:supergroup:2001") == "exact"
+    [record] = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert record.levelno == logging.WARNING and record.exc_info is None
+    assert "telegram:default:supergroup:2001" in record.getMessage()
+    assert "CHANNEL_PRIVATE" in record.getMessage()
 
 
 @pytest.mark.asyncio
