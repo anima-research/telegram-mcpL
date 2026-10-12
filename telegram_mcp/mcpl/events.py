@@ -23,15 +23,23 @@ from datetime import timezone
 from typing import TYPE_CHECKING, Any
 
 from telethon import TelegramClient, events
+from telethon.errors import RPCError
 from telethon.tl.types import (
     Channel,
     Chat,
     MessageEntityMention,
     MessageEntityMentionName,
+    PeerChannel,
+    UpdateChannel,
     User,
 )
 
-from .channels import channel_id_for, entity_to_descriptor
+from .channels import (
+    channel_id_for,
+    entity_to_descriptor,
+    forum_topic_of,
+    publish_declarations,
+)
 from .content import message_to_content_blocks
 from .types import ChannelIncomingMessage
 
@@ -257,15 +265,8 @@ async def build_incoming_message(
                 if replied_username:
                     metadata["replyToAuthorUsername"] = replied_username
 
-    # Forum topic id (supergroups only)
-    thread_id: str | None = None
-    reply_to = getattr(message, "reply_to", None)
-    if reply_to is not None and getattr(reply_to, "forum_topic", False):
-        top_id = getattr(reply_to, "reply_to_top_id", None) or getattr(
-            reply_to, "reply_to_msg_id", None
-        )
-        if top_id is not None:
-            thread_id = str(top_id)
+    # Forum topic id (supergroups only), read as the publish echo reads it.
+    thread_id = forum_topic_of(getattr(message, "reply_to", None))
 
     timestamp = message.date.astimezone(timezone.utc).isoformat() if message.date else ""
 
@@ -338,6 +339,42 @@ async def _build_chat_action_payload(
     return None
 
 
+async def redeclare_publish_target(
+    chat: Any,
+    *,
+    account_label: str,
+    self_id: int,
+    transport: McplTransport,
+    policy: PolicyState | None = None,
+    topics_seen: bool = False,
+) -> bool:
+    """Re-declare a chat whose publish target changed since the host was last
+    told it (RFC-011 §3).
+
+    A supergroup that turned its forum on still stands declared `root`, and
+    its topic messages would contradict that; one that turned it off still
+    stands `exact`. Telegram's updateChannel says a chat changed, and a topic
+    message (`topics_seen`) proves the chat has topics, whatever a cached chat
+    object says. Sends `channels/changed` with the current descriptor, on the
+    same transport, before the caller forwards anything from the chat, so the
+    host has the update first. Returns whether it re-declared.
+    """
+    current = entity_to_descriptor(
+        chat,
+        account_label=account_label,
+        self_id=self_id,
+        forum=True if topics_seen else None,
+    )
+    if current is None or not publish_declarations.is_stale(current):
+        return False
+    if policy is not None and not policy.can_register:
+        log.info("channels/changed (publish target) suppressed — channels.register not granted")
+        return False
+    await transport.send_notification("channels/changed", {"updated": [current]})
+    publish_declarations.record([current])
+    return True
+
+
 async def attach_event_handlers(
     client: TelegramClient,
     *,
@@ -349,6 +386,7 @@ async def attach_event_handlers(
 
     Currently:
       - NewMessage → channels/incoming
+      - UpdateChannel → channels/changed (a registered chat's re-declaration)
       - ChatAction → channels/changed (joins, leaves, kicks affecting us)
 
     `policy` (MCPL 0.5, §5.4): when given, every push is checked against the
@@ -398,9 +436,51 @@ async def attach_event_handlers(
                     policy.fs_enabled,
                 )
                 return
+            if payload.get("threadId") is not None:
+                # A topic message from a chat the host holds as `root` would
+                # contradict that declaration (RFC-011 §3): re-declare it
+                # first. Its own forum header proves the chat has topics. A
+                # failure here never costs the message: it is forwarded as
+                # before, as when the register grant is narrowed.
+                try:
+                    await redeclare_publish_target(
+                        await event.get_chat(),
+                        account_label=account_label,
+                        self_id=self_id,
+                        transport=transport,
+                        policy=policy,
+                        topics_seen=True,
+                    )
+                except Exception:
+                    log.exception("Failed to re-declare a topic message's chat; forwarding it")
             await transport.send_notification("channels/incoming", {"messages": [payload]})
         except Exception:
             log.exception("Failed to push NewMessage event")
+
+    @client.on(events.Raw(UpdateChannel))
+    async def on_channel_update(update):
+        # Telegram's notice that a channel's info changed and must be
+        # refetched. A supergroup that turned its forum on or off is
+        # re-declared here, whether or not a topic message follows (RFC-011
+        # §3). Only a supergroup the host holds a declaration for matters.
+        channel_id = channel_id_for(account_label, "supergroup", update.channel_id)
+        if publish_declarations.target_of(channel_id) is None:
+            return
+        try:
+            await redeclare_publish_target(
+                await client.get_entity(PeerChannel(update.channel_id)),
+                account_label=account_label,
+                self_id=self_id,
+                transport=transport,
+                policy=policy,
+            )
+        except RPCError as err:
+            # Telegram refused the refetch. An account that left the
+            # supergroup, or was removed from it, gets this notice too, and
+            # may no longer read it.
+            log.warning("Could not refetch changed channel %s: %s", channel_id, err)
+        except Exception:
+            log.exception("Failed to re-declare changed channel %s", channel_id)
 
     @client.on(events.ChatAction)
     async def on_chat_action(event):  # pragma: no cover — real-Telegram path
@@ -414,12 +494,15 @@ async def attach_event_handlers(
                 log.info("channels/changed suppressed — channels.register not granted")
                 return
             await transport.send_notification("channels/changed", payload)
+            publish_declarations.record(payload.get("added", []))
+            publish_declarations.forget(payload.get("removed", []))
         except Exception:
             log.exception("Failed to push ChatAction event")
 
     _attached_clients.add(id(client))
     log.info(
-        "Attached MCPL handlers (NewMessage, ChatAction) for account '%s' " "(self_id=%s)",
+        "Attached MCPL handlers (NewMessage, UpdateChannel, ChatAction) for account '%s' "
+        "(self_id=%s)",
         account_label,
         self_id,
     )
