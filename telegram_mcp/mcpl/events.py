@@ -220,16 +220,27 @@ async def build_incoming_message(
     if sender_username:
         metadata["senderUsername"] = sender_username
 
-    # Reply context — best-effort.
-    if getattr(message, "is_reply", False):
+    # Reply context — best-effort. In a forum topic, every post's reply header
+    # names the topic's root; only one that also carries reply_to_top_id
+    # replies to a message, the one reply_to_msg_id names.
+    reply_header = getattr(message, "reply_to", None)
+    is_topic_post = (
+        reply_header is not None
+        and getattr(reply_header, "forum_topic", False)
+        and getattr(reply_header, "reply_to_top_id", None) is None
+    )
+    if getattr(message, "is_reply", False) and not is_topic_post:
         metadata["isReply"] = True
-        reply_to = getattr(message, "reply_to", None)
-        reply_to_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
+        reply_to_id = getattr(reply_header, "reply_to_msg_id", None) if reply_header else None
         if reply_to_id is not None:
             metadata["replyToMessageId"] = str(reply_to_id)
         try:
             replied = await message.get_reply_message()
-        except Exception:  # noqa: BLE001 — never block on reply lookup
+        except Exception as exc:  # noqa: BLE001 — never block on reply lookup
+            # The message is still delivered, but not as a reply to us.
+            log.error(
+                "Reply lookup failed for message %s in %s: %r", message.id, descriptor["id"], exc
+            )
             replied = None
         if replied is not None:
             replied_author_id = getattr(replied.sender_id, "user_id", None) or getattr(

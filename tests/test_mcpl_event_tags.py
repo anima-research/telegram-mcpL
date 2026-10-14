@@ -1,5 +1,6 @@
 """MCPL chat tags describe Telegram addressing, senders, topics, and attachments."""
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -103,6 +104,31 @@ async def test_only_a_resolved_reply_to_our_account_is_addressed(reply_author):
     assert set(result["tags"]) == expected
 
 
+class FailingReplyLookup(FakeMessage):
+    async def get_reply_message(self):
+        raise ConnectionError("lookup failed")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reply_lookup_is_logged_and_the_message_still_delivered(caplog):
+    # Production's logging configuration, kept as it is: runtime sets the
+    # package logger, and its handlers, to ERROR.
+    from telegram_mcp import runtime
+
+    assert runtime.logger.level == logging.ERROR
+    message = FailingReplyLookup(
+        id=100,
+        text="reply",
+        is_reply=True,
+        reply_to=SimpleNamespace(reply_to_msg_id=10, forum_topic=False),
+    )
+    result = await incoming(message, sender=make_user(42))
+    assert set(result["tags"]) == {"chat:from-human", "chat:ambient"}
+    failures = [r.getMessage() for r in caplog.records if "Reply lookup failed" in r.getMessage()]
+    assert len(failures) == 1
+    assert f"message 100 in {result['channelId']}:" in failures[0]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sender_kind", ["human", "bot", "channel", "unknown"])
 async def test_sender_tags_require_a_resolved_user(sender_kind):
@@ -135,6 +161,55 @@ async def test_forum_topic_tag_follows_thread_id(topic):
     assert result.get("threadId") == ("7" if topic else None)
     assert "chat:ambient" in result["tags"]
     assert "chat:reply" not in result["tags"]
+
+
+class CountingReplyLookup(FakeMessage):
+    lookups = 0
+
+    async def get_reply_message(self):
+        self.lookups += 1
+        return await super().get_reply_message()
+
+
+@pytest.mark.asyncio
+async def test_a_post_in_a_topic_we_opened_is_not_a_reply_to_us():
+    # A plain topic post's reply header names the topic's root, which the
+    # account wrote, and has no reply_to_top_id.
+    message = CountingReplyLookup(
+        id=100,
+        text="topic post",
+        is_reply=True,
+        reply_to=SimpleNamespace(forum_topic=True, reply_to_msg_id=7, reply_to_top_id=None),
+        replied=SimpleNamespace(sender_id=99, message="topic opened"),
+    )
+    result = await incoming(message, kind="supergroup", sender=make_user(42))
+    assert set(result["tags"]) == {"chat:from-human", "chat:thread", "chat:ambient"}
+    assert result["threadId"] == "7"
+    assert message.lookups == 0
+    metadata = result["metadata"]
+    assert metadata["isReply"] is False
+    assert metadata["isReplyToBot"] is False
+    assert [key for key in metadata if key.startswith("replyTo")] == []
+
+
+@pytest.mark.asyncio
+async def test_a_reply_to_our_message_inside_a_topic_is_addressed():
+    message = FakeMessage(
+        id=100,
+        text="reply in topic",
+        is_reply=True,
+        reply_to=SimpleNamespace(forum_topic=True, reply_to_msg_id=12, reply_to_top_id=7),
+        replied=SimpleNamespace(sender_id=99, message="ours"),
+    )
+    result = await incoming(message, kind="supergroup", sender=make_user(42))
+    assert set(result["tags"]) == {
+        "chat:from-human",
+        "chat:thread",
+        "chat:reply",
+        "chat:addressed",
+    }
+    assert result["threadId"] == "7"
+    assert result["metadata"]["replyToMessageId"] == "12"
 
 
 @pytest.mark.asyncio
