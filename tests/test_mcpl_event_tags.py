@@ -125,9 +125,21 @@ async def test_a_mention_entity_that_splits_an_emoji_is_no_mention(text, offset,
     assert set(result["tags"]) == {"chat:from-human", "chat:ambient"}
 
 
+# Telegram sets a message's mentioned flag on a reply to the account's own
+# message, so each reply here carries the flag as Telegram would send it.
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reply_author", [99, 7, None])
-async def test_only_a_resolved_reply_to_our_account_is_addressed(reply_author):
+@pytest.mark.parametrize(
+    "reply_author,mentioned,expected",
+    [
+        pytest.param(99, True, {"chat:reply", "chat:addressed"}, id="to-us"),
+        pytest.param(7, False, {"chat:ambient"}, id="to-another"),
+        pytest.param(None, False, {"chat:ambient"}, id="to-another-gone"),
+        pytest.param(None, True, {"chat:addressed"}, id="to-us-gone"),
+    ],
+)
+async def test_reply_tags_follow_the_resolved_author_and_telegrams_flag(
+    reply_author, mentioned, expected
+):
     replied = SimpleNamespace(sender_id=reply_author, message="earlier") if reply_author else None
     message = FakeMessage(
         id=100,
@@ -135,12 +147,44 @@ async def test_only_a_resolved_reply_to_our_account_is_addressed(reply_author):
         is_reply=True,
         reply_to=SimpleNamespace(reply_to_msg_id=10, forum_topic=False),
         replied=replied,
+        mentioned=mentioned,
     )
     result = await incoming(message, sender=make_user(42))
-    expected = {"chat:from-human", "chat:ambient"}
-    if reply_author == 99:
-        expected = {"chat:from-human", "chat:reply", "chat:addressed"}
-    assert set(result["tags"]) == expected
+    assert set(result["tags"]) == {"chat:from-human"} | expected
+
+
+@pytest.mark.asyncio
+async def test_a_bots_reply_to_us_is_a_reply_not_a_mention():
+    # A host can let a bot wake the agent only by an explicit @-mention, which
+    # breaks reply loops between bots, so Telegram's flag on a bot's reply to
+    # us mustn't read as one.
+    bot = make_user(42)
+    bot.bot = True
+    message = FakeMessage(
+        id=100,
+        text="reply",
+        is_reply=True,
+        reply_to=SimpleNamespace(reply_to_msg_id=10, forum_topic=False),
+        replied=SimpleNamespace(sender_id=99, message="earlier"),
+        mentioned=True,
+    )
+    result = await incoming(message, sender=bot)
+    assert set(result["tags"]) == {"chat:from-bot", "chat:reply", "chat:addressed"}
+
+
+@pytest.mark.asyncio
+async def test_an_at_mention_in_a_reply_to_another_is_a_mention():
+    message = FakeMessage(
+        id=100,
+        text="@mybot see this",
+        entities=[MessageEntityMention(offset=0, length=6)],
+        is_reply=True,
+        reply_to=SimpleNamespace(reply_to_msg_id=10, forum_topic=False),
+        replied=SimpleNamespace(sender_id=7, message="earlier"),
+        mentioned=True,
+    )
+    result = await incoming(message, sender=make_user(42))
+    assert set(result["tags"]) == {"chat:from-human", "chat:mention", "chat:addressed"}
 
 
 class FailingReplyLookup(FakeMessage):
@@ -149,7 +193,18 @@ class FailingReplyLookup(FakeMessage):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_reply_lookup_is_logged_and_the_message_still_delivered(caplog):
+@pytest.mark.parametrize(
+    "mentioned,expected",
+    [
+        # A reply to the account's message carries Telegram's flag, which
+        # addresses it even though the reply can't be confirmed.
+        pytest.param(True, "chat:addressed", id="to-us"),
+        pytest.param(False, "chat:ambient", id="to-another"),
+    ],
+)
+async def test_a_failed_reply_lookup_is_logged_and_the_message_still_delivered(
+    caplog, mentioned, expected
+):
     # Production's logging configuration, kept as it is: runtime sets the
     # package logger, and its handlers, to ERROR.
     from telegram_mcp import runtime
@@ -160,9 +215,10 @@ async def test_a_failed_reply_lookup_is_logged_and_the_message_still_delivered(c
         text="reply",
         is_reply=True,
         reply_to=SimpleNamespace(reply_to_msg_id=10, forum_topic=False),
+        mentioned=mentioned,
     )
     result = await incoming(message, sender=make_user(42))
-    assert set(result["tags"]) == {"chat:from-human", "chat:ambient"}
+    assert set(result["tags"]) == {"chat:from-human", expected}
     failures = [r.getMessage() for r in caplog.records if "Reply lookup failed" in r.getMessage()]
     assert len(failures) == 1
     assert f"message 100 in {result['channelId']}:" in failures[0]
@@ -211,15 +267,18 @@ class CountingReplyLookup(FakeMessage):
 
 
 @pytest.mark.asyncio
-async def test_a_post_in_a_topic_we_opened_is_not_a_reply_to_us():
+@pytest.mark.parametrize("mentioned", [False, True], ids=["unflagged", "flagged"])
+async def test_a_post_in_a_topic_we_opened_is_not_a_reply_to_us(mentioned):
     # A plain topic post's reply header names the topic's root, which the
-    # account wrote, and has no reply_to_top_id.
+    # account wrote, and has no reply_to_top_id. Whether Telegram flags such
+    # a post as mentioning the root's author, it doesn't address the account.
     message = CountingReplyLookup(
         id=100,
         text="topic post",
         is_reply=True,
         reply_to=SimpleNamespace(forum_topic=True, reply_to_msg_id=7, reply_to_top_id=None),
         replied=SimpleNamespace(sender_id=99, message="topic opened"),
+        mentioned=mentioned,
     )
     result = await incoming(message, kind="supergroup", sender=make_user(42))
     assert set(result["tags"]) == {"chat:from-human", "chat:thread", "chat:ambient"}
@@ -239,6 +298,7 @@ async def test_a_reply_to_our_message_inside_a_topic_is_addressed():
         is_reply=True,
         reply_to=SimpleNamespace(forum_topic=True, reply_to_msg_id=12, reply_to_top_id=7),
         replied=SimpleNamespace(sender_id=99, message="ours"),
+        mentioned=True,
     )
     result = await incoming(message, kind="supergroup", sender=make_user(42))
     assert set(result["tags"]) == {

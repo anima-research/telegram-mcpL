@@ -300,14 +300,24 @@ async def build_incoming_message(
     # The core chat:* tags, as discord-mcpl emits them: every message carries
     # chat:addressed or chat:ambient, and a private chat carries chat:private
     # beside chat:dm.
+    #
+    # Telegram's mentioned flag also marks a reply to the account's own
+    # message, so it names an @-mention only on a message with no reply
+    # header. On a reply it still addresses the account, by a mention or by a
+    # reply to us, even when the reply lookup failed. A plain topic post's
+    # header names the topic's root, which may be the account's, so on that
+    # post the flag may mean no more than that, and isn't read.
+    flagged = bool(getattr(message, "mentioned", False))
+    at_mention = is_username_mention or is_explicit_mention or (flagged and reply_header is None)
+    flag_addresses = flagged and not is_topic_post
     tags: list[str] = []
-    if is_mention:
+    if at_mention:
         tags.append("chat:mention")
     if metadata["isReplyToBot"]:
         tags.append("chat:reply")
     if metadata["isPrivate"]:
         tags.extend(["chat:dm", "chat:private"])
-    addressed = is_mention or metadata["isReplyToBot"] or metadata["isPrivate"]
+    addressed = at_mention or flag_addresses or metadata["isReplyToBot"] or metadata["isPrivate"]
     tags.append("chat:addressed" if addressed else "chat:ambient")
     # Channel identities and unresolved senders don't reveal human/bot authorship.
     if isinstance(sender, User):
