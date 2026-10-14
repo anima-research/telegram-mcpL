@@ -184,7 +184,8 @@ async def test_tagged_message_reaches_the_incoming_notification():
 
         def on(self, event_filter):
             def register(handler):
-                handlers[event_filter.__name__] = handler
+                name = getattr(event_filter, "__name__", type(event_filter).__name__)
+                handlers[name] = handler
                 return handler
 
             return register
