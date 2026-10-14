@@ -7,11 +7,21 @@ import pytest
 from telethon.tl.types import (
     Channel,
     Chat,
+    DocumentAttributeAnimated,
     DocumentAttributeAudio,
+    DocumentAttributeFilename,
+    DocumentAttributeSticker,
+    DocumentAttributeVideo,
+    GeoPointEmpty,
+    InputStickerSetEmpty,
     MessageEntityMention,
     MessageEntityMentionName,
+    MessageMediaContact,
     MessageMediaDocument,
+    MessageMediaGeo,
     MessageMediaPhoto,
+    MessageMediaPoll,
+    MessageMediaVenue,
     MessageMediaWebPage,
 )
 
@@ -212,36 +222,81 @@ async def test_a_reply_to_our_message_inside_a_topic_is_addressed():
     assert result["metadata"]["replyToMessageId"] == "12"
 
 
+def document(mime, *attributes):
+    return MessageMediaDocument(
+        document=SimpleNamespace(mime_type=mime, size=10, attributes=list(attributes))
+    )
+
+
+def sticker():
+    return DocumentAttributeSticker(alt="", stickerset=InputStickerSetEmpty())
+
+
+def video(**flags):
+    return DocumentAttributeVideo(duration=1, w=1, h=1, **flags)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "media_kind,mime,voice,expected",
+    "media,expected",
     [
-        ("photo", None, False, "chat:has-image"),
-        ("document", "image/png", False, "chat:has-image"),
-        ("document", "IMAGE/PNG", False, "chat:has-image"),
-        ("document", "audio/ogg", False, "chat:has-audio"),
-        ("document", "application/octet-stream", True, "chat:has-audio"),
-        ("document", "text/plain", False, "chat:has-file"),
-        ("document", "video/mp4", False, "chat:has-file"),
-        ("document", None, False, "chat:has-file"),
-        ("webpage", None, False, None),
+        pytest.param(MessageMediaPhoto(), "chat:has-image", id="photo"),
+        pytest.param(document("image/png"), "chat:has-image", id="image"),
+        pytest.param(document("IMAGE/PNG"), "chat:has-image", id="image-uppercase-mime"),
+        pytest.param(document("audio/ogg"), "chat:has-audio", id="audio-mime"),
+        pytest.param(
+            document("application/octet-stream", DocumentAttributeAudio(duration=1, voice=True)),
+            "chat:has-audio",
+            id="voice-note",
+        ),
+        pytest.param(document("text/plain"), "chat:has-file", id="text"),
+        pytest.param(
+            document("application/pdf", DocumentAttributeFilename(file_name="report.pdf")),
+            "chat:has-file",
+            id="named-upload",
+        ),
+        pytest.param(document("video/mp4"), "chat:has-file", id="video"),
+        pytest.param(
+            document("video/mp4", video(), DocumentAttributeAnimated()),
+            "chat:has-file",
+            id="gif",
+        ),
+        pytest.param(
+            document("application/x-tgsticker", sticker()), "chat:has-file", id="animated-sticker"
+        ),
+        pytest.param(
+            document("video/webm", sticker(), video()), "chat:has-file", id="video-sticker"
+        ),
+        pytest.param(
+            document("video/mp4", video(round_message=True)),
+            "chat:has-file",
+            id="round-video-note",
+        ),
+        pytest.param(document(None), "chat:has-file", id="no-mime"),
+        pytest.param(MessageMediaDocument(document=None), "chat:has-file", id="absent-document"),
+        pytest.param(MessageMediaWebPage(webpage=None), None, id="link-preview"),
+        pytest.param(MessageMediaPoll(poll=None, results=None), None, id="poll"),
+        pytest.param(
+            MessageMediaContact(phone_number="", first_name="", last_name="", vcard="", user_id=0),
+            None,
+            id="contact",
+        ),
+        pytest.param(MessageMediaGeo(geo=GeoPointEmpty()), None, id="location"),
+        pytest.param(
+            MessageMediaVenue(
+                geo=GeoPointEmpty(),
+                title="",
+                address="",
+                provider="",
+                venue_id="",
+                venue_type="",
+            ),
+            None,
+            id="venue",
+        ),
     ],
 )
-async def test_media_tags_describe_attachments_even_when_not_inlined(
-    media_kind, mime, voice, expected
-):
-    if media_kind == "photo":
-        media = MessageMediaPhoto()
-    elif media_kind == "webpage":
-        media = MessageMediaWebPage(webpage=None)
-    else:
-        media = MessageMediaDocument(
-            document=SimpleNamespace(
-                mime_type=mime,
-                size=10,
-                attributes=[DocumentAttributeAudio(duration=1, voice=True)] if voice else [],
-            )
-        )
+async def test_media_tags_describe_attachments_even_when_not_inlined(media, expected):
     # No download method: images and text files take the placeholder path.
     result = await incoming(FakeMessage(id=100, text="", media=media), sender=make_user(42))
     tags = {tag for tag in result["tags"] if tag.startswith("chat:has-")}
