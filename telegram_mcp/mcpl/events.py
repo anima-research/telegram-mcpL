@@ -23,6 +23,7 @@ from datetime import timezone
 from typing import TYPE_CHECKING, Any
 
 from telethon import TelegramClient, events
+from telethon.helpers import add_surrogate
 from telethon.tl.types import (
     Channel,
     Chat,
@@ -161,7 +162,11 @@ def _has_username_mention(message: Any, username: str | None) -> bool:
     if not username:
         return False
     entities = getattr(message, "entities", None) or []
-    text = getattr(message, "message", "") or ""
+    # Entity offsets count UTF-16 code units: slice the text with each astral
+    # character as its surrogate pair, as Telethon's parsers do. The target is
+    # ASCII, so the slice is compared as it is, and one holding half of a pair
+    # (an entity that splits a character) simply doesn't match.
+    text = add_surrogate(getattr(message, "message", "") or "")
     target = f"@{username}".lower()
     for ent in entities:
         if isinstance(ent, MessageEntityMention):
@@ -315,13 +320,15 @@ async def build_incoming_message(
     elif isinstance(media, MessageMediaDocument):
         document = getattr(media, "document", None)
         mime = (getattr(document, "mime_type", None) or "").lower()
-        is_voice = any(
-            isinstance(attr, DocumentAttributeAudio) and attr.voice
+        # Telegram marks voice notes and music alike with DocumentAttributeAudio,
+        # whatever MIME type the sender's client gave the bytes.
+        is_audio = any(
+            isinstance(attr, DocumentAttributeAudio)
             for attr in (getattr(document, "attributes", None) or [])
         )
         if mime.startswith("image/"):
             tags.append("chat:has-image")
-        elif mime.startswith("audio/") or is_voice:
+        elif mime.startswith("audio/") or is_audio:
             tags.append("chat:has-audio")
         else:
             tags.append("chat:has-file")

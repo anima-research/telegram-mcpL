@@ -97,6 +97,35 @@ async def test_mention_tags_use_account_mention_facts(signal):
 
 
 @pytest.mark.asyncio
+async def test_a_mention_after_an_emoji_is_found_at_its_utf16_offset():
+    # Telegram counts the emoji as two UTF-16 code units, so the mention
+    # starts at offset 3, where Python's index is 2.
+    message = FakeMessage(
+        id=100,
+        text="\U0001f600 @MyBot hello",
+        entities=[MessageEntityMention(offset=3, length=6)],
+    )
+    result = await incoming(message, sender=make_user(42))
+    assert set(result["tags"]) == {"chat:from-human", "chat:mention", "chat:addressed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,offset,length",
+    [
+        pytest.param("\U0001f600@mybot hello", 1, 6, id="starts-inside-the-emoji"),
+        pytest.param("@mybot\U0001f600 hello", 0, 7, id="ends-inside-the-emoji"),
+    ],
+)
+async def test_a_mention_entity_that_splits_an_emoji_is_no_mention(text, offset, length):
+    message = FakeMessage(
+        id=100, text=text, entities=[MessageEntityMention(offset=offset, length=length)]
+    )
+    result = await incoming(message, sender=make_user(42))
+    assert set(result["tags"]) == {"chat:from-human", "chat:ambient"}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reply_author", [99, 7, None])
 async def test_only_a_resolved_reply_to_our_account_is_addressed(reply_author):
     replied = SimpleNamespace(sender_id=reply_author, message="earlier") if reply_author else None
@@ -248,6 +277,11 @@ def video(**flags):
             document("application/octet-stream", DocumentAttributeAudio(duration=1, voice=True)),
             "chat:has-audio",
             id="voice-note",
+        ),
+        pytest.param(
+            document("application/octet-stream", DocumentAttributeAudio(duration=1, voice=False)),
+            "chat:has-audio",
+            id="music-under-another-mime",
         ),
         pytest.param(document("text/plain"), "chat:has-file", id="text"),
         pytest.param(
