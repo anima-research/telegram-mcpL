@@ -18,6 +18,7 @@ from typing import Any
 
 from telethon import TelegramClient
 
+from .access import chat_allowed
 from .channels import enumerate_channels
 from .types import ChannelsPublishParams, ChannelsPublishResult, McplContentBlock
 
@@ -118,6 +119,8 @@ def make_publish_handler(
             peer: Any = "me"
         else:
             assert peer_id is not None  # parse_channel_id guarantees this
+            if not chat_allowed(peer_id):
+                raise ValueError(f"{channel_id} is not in TELEGRAM_ALLOWED_CHAT_IDS")
             peer = await resolve_entity_fn(peer_id, client)
 
         text = extract_text(content)
@@ -267,6 +270,8 @@ def make_typing_handler(
             return
         client = clients.get(account_label)
         if client is None:
+            return
+        if kind != "saved" and not chat_allowed(peer_id):
             return
 
         # Arm the deadline first so an already-running loop picks it up.

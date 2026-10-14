@@ -31,6 +31,7 @@ from telethon.tl.types import (
     User,
 )
 
+from .access import chat_allowed
 from .channels import channel_id_for, entity_to_descriptor
 from .content import message_to_content_blocks
 from .types import ChannelIncomingMessage
@@ -380,6 +381,9 @@ async def attach_event_handlers(
         # the agent would see its own reply, etc.). The agent's identity is
         # its Telegram account; its own posts don't need to feed back in.
         if getattr(event, "out", False):
+            return
+        if not chat_allowed(getattr(event, "chat_id", None)):
+            log.debug("channels/incoming skipped: chat not in TELEGRAM_ALLOWED_CHAT_IDS")
             return
         try:
             payload = await build_incoming_message(

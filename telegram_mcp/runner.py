@@ -168,6 +168,22 @@ async def _verify_expected_username(label: str, client) -> None:
     )
 
 
+async def _sign_in_with_bot_token(label, client) -> bool:
+    """Sign an unauthorized session in as a bot when a token is configured.
+
+    TELEGRAM_BOT_TOKEN_<LABEL>, else TELEGRAM_BOT_TOKEN for the default
+    account. With a file session the login is kept, so this runs once.
+    """
+    from telegram_mcp.mcpl.access import bot_token_for
+
+    token = bot_token_for(label)
+    if not token:
+        return False
+    await client.sign_in(bot_token=token)
+    print(f"Telegram client '{label}' signed in as a bot.", file=sys.stderr)
+    return True
+
+
 async def _connect_authorized_client(label, client) -> None:
     # First, prevent our own duplicate-spawn case outright: a per-session lock
     # means a second instance of this server never even attempts to connect
@@ -211,6 +227,10 @@ async def _connect_authorized_client(label, client) -> None:
             await asyncio.sleep(delay)
 
     if await client.is_user_authorized():
+        await _verify_expected_username(label, client)
+        return
+
+    if await _sign_in_with_bot_token(label, client):
         await _verify_expected_username(label, client)
         return
 
