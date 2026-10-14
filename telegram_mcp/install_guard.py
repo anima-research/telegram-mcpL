@@ -11,7 +11,8 @@ import json
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 DISTRIBUTION_NAME = "telegram-mcp"
 
@@ -31,6 +32,7 @@ class DistributionIdentity:
     urls: tuple[str, ...] = ()
     summary: str = ""
     direct_url: str = ""
+    source_root: Path | None = None
 
     @classmethod
     def from_distribution(cls, dist: metadata.Distribution) -> "DistributionIdentity":
@@ -67,7 +69,8 @@ class DistributionIdentity:
             maintainers=maintainers,
             urls=urls,
             summary=package_metadata.get("Summary", ""),
-            direct_url=direct_url,
+            direct_url=direct_url or "",
+            source_root=_distribution_source_root(dist),
         )
 
 
@@ -82,6 +85,52 @@ def _project_root_declares_distribution_name(path: Path) -> bool:
         return False
 
     return f'name = "{DISTRIBUTION_NAME}"' in pyproject_text
+
+
+def _resolve_path(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def _candidate_is_project_root(path: Path) -> bool:
+    return _project_root_declares_distribution_name(_resolve_path(path))
+
+
+def _distribution_source_root(dist: metadata.Distribution) -> Path | None:
+    """Return an editable/source-checkout root for installer metadata.
+
+    ``uv sync`` installs the project editably. In that mode ``importlib.metadata``
+    can resolve the active distribution to ``telegram_mcp.egg-info`` in the
+    checkout, while the PEP 610 ``direct_url.json`` file lives in the
+    environment's ``.dist-info`` directory. Treating the adjacent project root as
+    source provenance keeps the PyPI-collision guard strict for normal installs
+    without blocking cloned checkouts.
+    """
+
+    dist_path = getattr(dist, "_path", None)
+    if dist_path is not None:
+        metadata_path = Path(dist_path)
+        if metadata_path.name.endswith(".egg-info"):
+            candidate = metadata_path.parent
+            if _candidate_is_project_root(candidate):
+                return _resolve_path(candidate)
+
+    files = getattr(dist, "files", None)
+    locate_file = getattr(dist, "locate_file", None)
+    if not files or not callable(locate_file):
+        return None
+
+    for package_file in files:
+        if Path(str(package_file)) != Path("pyproject.toml"):
+            continue
+
+        candidate = Path(locate_file(package_file)).parent
+        if _candidate_is_project_root(candidate):
+            return _resolve_path(candidate)
+
+    return None
 
 
 def _direct_url_json(direct_url: str) -> dict:
@@ -108,7 +157,9 @@ def _direct_url_is_explicit_source_install(direct_url: str) -> bool:
     parsed_url = urlparse(raw_url)
 
     if parsed_url.scheme == "file":
-        source_path = Path(unquote(parsed_url.path)).resolve()
+        # url2pathname handles Windows drive-letter URLs (``/C:/...``) correctly;
+        # ``Path(unquote(path))`` mangles them into drive-relative paths (``C:...``).
+        source_path = Path(url2pathname(parsed_url.path)).resolve()
         return _project_root_declares_distribution_name(source_path)
 
     vcs_info = direct_url_data.get("vcs_info")
@@ -116,7 +167,10 @@ def _direct_url_is_explicit_source_install(direct_url: str) -> bool:
 
 
 def _looks_like_explicit_source_install(identity: DistributionIdentity) -> bool:
-    return _direct_url_is_explicit_source_install(identity.direct_url)
+    return (
+        _direct_url_is_explicit_source_install(identity.direct_url)
+        or identity.source_root is not None
+    )
 
 
 def _format_unsafe_installation_message(identity: DistributionIdentity) -> str:

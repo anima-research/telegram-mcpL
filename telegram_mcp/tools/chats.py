@@ -1,11 +1,162 @@
 """Chats MCP tools."""
 
+import secrets
+import struct
+
+from telethon.errors import BotMethodInvalidError
+from telethon.tl.tlobject import TLObject, TLRequest
+
 from telegram_mcp.runtime import *
+
+
+class GetForumTopicsRequest(TLRequest):
+    """Raw request for channels.getForumTopics missing in Telethon 1.42-1.43."""
+
+    CONSTRUCTOR_ID = 0x0DE560D1
+    SUBCLASS_OF_ID = 0x0
+
+    def __init__(self, channel, offset_date, offset_id, offset_topic, limit, q=None):
+        self.channel = channel
+        self.q = q
+        self.offset_date = offset_date
+        self.offset_id = offset_id
+        self.offset_topic = offset_topic
+        self.limit = limit
+
+    async def resolve(self, client, utils):
+        self.channel = utils.get_input_channel(await client.get_input_entity(self.channel))
+
+    def to_dict(self):
+        return {
+            "_": "GetForumTopicsRequest",
+            "channel": (
+                self.channel.to_dict() if isinstance(self.channel, TLObject) else self.channel
+            ),
+            "q": self.q,
+            "offset_date": self.offset_date,
+            "offset_id": self.offset_id,
+            "offset_topic": self.offset_topic,
+            "limit": self.limit,
+        }
+
+    def _bytes(self):
+        flags = 0 if self.q is None or self.q is False else 1
+        return b"".join(
+            (
+                struct.pack("<I", self.CONSTRUCTOR_ID),
+                struct.pack("<I", flags),
+                self.channel._bytes(),
+                b"" if self.q is None or self.q is False else self.serialize_bytes(self.q),
+                struct.pack("<i", self.offset_date),
+                struct.pack("<i", self.offset_id),
+                struct.pack("<i", self.offset_topic),
+                struct.pack("<i", self.limit),
+            )
+        )
+
+    @classmethod
+    def from_reader(cls, reader):
+        flags = reader.read_int()
+        channel = reader.tgread_object()
+        q = reader.tgread_string() if flags & 1 else None
+        offset_date = reader.read_int()
+        offset_id = reader.read_int()
+        offset_topic = reader.read_int()
+        limit = reader.read_int()
+        return cls(
+            channel=channel,
+            offset_date=offset_date,
+            offset_id=offset_id,
+            offset_topic=offset_topic,
+            limit=limit,
+            q=q,
+        )
+
+
+class CreateForumTopicRequest(TLRequest):
+    """Raw request for messages.createForumTopic missing in Telethon 1.42."""
+
+    CONSTRUCTOR_ID = 0x2F98C3D5
+    SUBCLASS_OF_ID = 0x0
+
+    def __init__(
+        self,
+        peer,
+        title,
+        random_id,
+        icon_color=None,
+        icon_emoji_id=None,
+        send_as=None,
+    ):
+        self.peer = peer
+        self.title = title
+        self.icon_color = icon_color
+        self.icon_emoji_id = icon_emoji_id
+        self.random_id = random_id
+        self.send_as = send_as
+
+    async def resolve(self, client, utils):
+        self.peer = utils.get_input_peer(await client.get_input_entity(self.peer))
+        if self.send_as is not None:
+            self.send_as = utils.get_input_peer(await client.get_input_entity(self.send_as))
+
+    def to_dict(self):
+        return {
+            "_": "CreateForumTopicRequest",
+            "peer": self.peer.to_dict() if isinstance(self.peer, TLObject) else self.peer,
+            "title": self.title,
+            "icon_color": self.icon_color,
+            "icon_emoji_id": self.icon_emoji_id,
+            "random_id": self.random_id,
+            "send_as": (
+                self.send_as.to_dict() if isinstance(self.send_as, TLObject) else self.send_as
+            ),
+        }
+
+    def _bytes(self):
+        flags = 0
+        if self.icon_color is not None:
+            flags |= 1 << 0
+        if self.send_as is not None:
+            flags |= 1 << 2
+        if self.icon_emoji_id is not None:
+            flags |= 1 << 3
+
+        return b"".join(
+            (
+                struct.pack("<I", self.CONSTRUCTOR_ID),
+                struct.pack("<I", flags),
+                self.peer._bytes(),
+                self.serialize_bytes(self.title),
+                b"" if self.icon_color is None else struct.pack("<i", self.icon_color),
+                b"" if self.icon_emoji_id is None else struct.pack("<q", self.icon_emoji_id),
+                struct.pack("<q", self.random_id),
+                b"" if self.send_as is None else self.send_as._bytes(),
+            )
+        )
+
+    @classmethod
+    def from_reader(cls, reader):
+        flags = reader.read_int()
+        peer = reader.tgread_object()
+        title = reader.tgread_string()
+        icon_color = reader.read_int() if flags & (1 << 0) else None
+        icon_emoji_id = reader.read_long() if flags & (1 << 3) else None
+        random_id = reader.read_long()
+        send_as = reader.tgread_object() if flags & (1 << 2) else None
+        return cls(
+            peer=peer,
+            title=title,
+            random_id=random_id,
+            icon_color=icon_color,
+            icon_emoji_id=icon_emoji_id,
+            send_as=send_as,
+        )
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Chats", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
-async def get_chats(account: str = None, page: int = 1, page_size: int = 20) -> str:
+async def get_chats(account: Optional[str] = None, page: int = 1, page_size: int = 20) -> str:
     """
     Get a paginated list of chats.
     Args:
@@ -17,7 +168,12 @@ async def get_chats(account: str = None, page: int = 1, page_size: int = 20) -> 
     try:
         cl = get_client(account)
         await ensure_connected(cl)
-        dialogs = await cl.get_dialogs()
+        try:
+            dialogs = await cl.get_dialogs()
+        except BotMethodInvalidError:
+            return "Listing chats/dialogs is not supported for bot accounts (Telegram API restriction: bots cannot fetch dialog lists)."
+        if is_chat_allowlist_enabled():
+            dialogs = [d for d in dialogs if is_chat_allowed(get_marked_id(d.entity), d.entity)]
         start = (page - 1) * page_size
         end = start + page_size
         if start >= len(dialogs):
@@ -48,7 +204,7 @@ async def get_chats(account: str = None, page: int = 1, page_size: int = 20) -> 
 )
 @with_account(readonly=False)
 @validate_id("channel")
-async def subscribe_public_channel(channel: Union[int, str], account: str = None) -> str:
+async def subscribe_public_channel(channel: Union[int, str], account: Optional[str] = None) -> str:
     """
     Subscribe (join) to a public channel or supergroup by username or ID.
 
@@ -75,21 +231,23 @@ async def subscribe_public_channel(channel: Union[int, str], account: str = None
 
 @mcp.tool(annotations=ToolAnnotations(title="List Topics", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
+@validate_id("chat_id")
 async def list_topics(
-    chat_id: int,
+    chat_id: Union[int, str],
     limit: int = 200,
     offset_topic: int = 0,
-    search_query: str = None,
-    account: str = None,
+    search_query: Optional[str] = None,
+    account: Optional[str] = None,
 ) -> str:
     """
     Retrieve forum topics from a supergroup with the forum feature enabled.
 
-    Note for LLM: You can send a message to a selected topic via reply_to_message tool
-    by using Topic ID as the message_id parameter.
+    Note for LLM: Send into a topic by passing Topic ID as topic_id to send_file /
+    send_album / send_voice / send_sticker / send_gif, or as message_id to
+    reply_to_message for text.
 
     Args:
-        chat_id: The ID of the forum-enabled chat (supergroup).
+        chat_id: The forum-enabled supergroup ID or username.
         limit: Maximum number of topics to retrieve.
         offset_topic: Topic ID offset for pagination.
         search_query: Optional query to filter topics by title.
@@ -107,7 +265,7 @@ async def list_topics(
             return "The specified supergroup does not have forum topics enabled."
 
         result = await cl(
-            functions.channels.GetForumTopicsRequest(
+            GetForumTopicsRequest(
                 channel=entity,
                 offset_date=0,
                 offset_id=0,
@@ -163,16 +321,297 @@ async def list_topics(
         )
 
 
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Enable Forum Topics", openWorldHint=True, destructiveHint=True, idempotentHint=True
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def enable_forum_topics(
+    chat_id: Union[int, str], tabs: bool = True, account: Optional[str] = None
+) -> str:
+    """
+    Enable Telegram forum topics for a supergroup.
+
+    Args:
+        chat_id: The supergroup ID or username.
+        tabs: Whether Telegram should display topics as tabs (default True).
+
+    The caller must be an admin with permission to change chat info.
+    """
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+
+        if not isinstance(entity, Channel) or not getattr(entity, "megagroup", False):
+            return "The specified chat is not a supergroup."
+
+        if getattr(entity, "forum", False):
+            title = sanitize_name(getattr(entity, "title", str(chat_id)))
+            return f"Forum topics already enabled for {title}."
+
+        await cl(functions.channels.ToggleForumRequest(channel=entity, enabled=True, tabs=tabs))
+        # Keep the resolved entity in sync for callers/tests that reuse it.
+        try:
+            entity.forum = True
+        except Exception:
+            pass
+
+        title = sanitize_name(getattr(entity, "title", str(chat_id)))
+        return f"Forum topics enabled for {title}."
+    except Exception as e:
+        return log_and_format_error("enable_forum_topics", e, chat_id=chat_id, tabs=tabs)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Create Forum Topic", openWorldHint=True, destructiveHint=True
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def create_forum_topic(
+    chat_id: Union[int, str],
+    title: str,
+    icon_color: Optional[int] = None,
+    icon_emoji_id: Optional[int] = None,
+    account: Optional[str] = None,
+) -> str:
+    """
+    Create a Telegram forum topic in a forum-enabled supergroup.
+
+    Args:
+        chat_id: The forum-enabled supergroup ID or username.
+        title: Topic title.
+        icon_color: Optional Telegram topic icon color integer.
+        icon_emoji_id: Optional custom emoji document ID for the topic icon.
+
+    Returns a JSON result with chat_id, topic_id (when Telegram returns it), and title.
+    """
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+
+        if not isinstance(entity, Channel) or not getattr(entity, "megagroup", False):
+            return "The specified chat is not a supergroup."
+
+        if not getattr(entity, "forum", False):
+            return (
+                "The specified supergroup does not have forum topics enabled. "
+                "Use enable_forum_topics first."
+            )
+
+        clean_title = sanitize_user_content(title, max_length=128)
+        result = await cl(
+            CreateForumTopicRequest(
+                peer=entity,
+                title=clean_title,
+                random_id=secrets.randbits(63),
+                icon_color=icon_color,
+                icon_emoji_id=icon_emoji_id,
+            )
+        )
+
+        topic_id = _extract_created_topic_id(result)
+        record = {
+            "chat_id": get_marked_id(entity),
+            "title": clean_title,
+        }
+        if topic_id is not None:
+            record["topic_id"] = topic_id
+
+        return format_tool_result([record])
+    except Exception as e:
+        return log_and_format_error(
+            "create_forum_topic",
+            e,
+            chat_id=chat_id,
+            title=title,
+            icon_color=icon_color,
+            icon_emoji_id=icon_emoji_id,
+        )
+
+
+def _extract_created_topic_id(result) -> Optional[int]:
+    """Best-effort extraction of the top message/topic ID from Updates."""
+    updates = getattr(result, "updates", None) or []
+    for update in updates:
+        message = getattr(update, "message", None)
+        message_id = getattr(message, "id", None)
+        if isinstance(message_id, int):
+            return message_id
+
+        update_id = getattr(update, "id", None)
+        if isinstance(update_id, int):
+            return update_id
+
+    message = getattr(result, "message", None)
+    message_id = getattr(message, "id", None)
+    if isinstance(message_id, int):
+        return message_id
+
+    return None
+
+
+def _forum_supergroup_error(entity) -> Optional[str]:
+    """Return a user-facing error when the entity cannot hold forum topics."""
+    if not isinstance(entity, Channel) or not getattr(entity, "megagroup", False):
+        return "The specified chat is not a supergroup."
+    if not getattr(entity, "forum", False):
+        return (
+            "The specified supergroup does not have forum topics enabled. "
+            "Use enable_forum_topics first."
+        )
+    return None
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Edit Forum Topic",
+        openWorldHint=True,
+        destructiveHint=True,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def edit_forum_topic(
+    chat_id: Union[int, str],
+    topic_id: int,
+    title: Optional[str] = None,
+    icon_emoji_id: Optional[int] = None,
+    closed: Optional[bool] = None,
+    hidden: Optional[bool] = None,
+    account: Optional[str] = None,
+) -> str:
+    """
+    Edit a forum topic in a forum-enabled supergroup. Pass only the fields to change.
+
+    Args:
+        chat_id: The forum-enabled supergroup ID or username.
+        topic_id: ID of the topic to edit.
+        title: New topic title.
+        icon_emoji_id: New custom emoji document ID for the icon (0 removes it).
+        closed: True closes the topic, False reopens it.
+        hidden: True hides the General topic, False shows it (General topic only).
+
+    Returns a JSON result with chat_id, topic_id and the fields that were changed.
+    """
+    changes = {
+        "title": title,
+        "icon_emoji_id": icon_emoji_id,
+        "closed": closed,
+        "hidden": hidden,
+    }
+    changes = {key: value for key, value in changes.items() if value is not None}
+    if not changes:
+        return "Nothing to change: pass title, icon_emoji_id, closed or hidden."
+
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+
+        error = _forum_supergroup_error(entity)
+        if error:
+            return error
+
+        if "title" in changes:
+            changes["title"] = sanitize_user_content(changes["title"], max_length=128)
+
+        await cl(
+            functions.messages.EditForumTopicRequest(peer=entity, topic_id=topic_id, **changes)
+        )
+
+        record = {"chat_id": get_marked_id(entity), "topic_id": topic_id, **changes}
+        return format_tool_result([record])
+    except Exception as e:
+        return log_and_format_error(
+            "edit_forum_topic",
+            e,
+            chat_id=chat_id,
+            topic_id=topic_id,
+            title=title,
+            icon_emoji_id=icon_emoji_id,
+            closed=closed,
+            hidden=hidden,
+        )
+
+
+# Telegram deletes topic history in batches: a non-zero offset in the
+# AffectedHistory result means the same request has to be sent again.
+_DELETE_TOPIC_MAX_BATCHES = 100
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Delete Forum Topic",
+        openWorldHint=True,
+        destructiveHint=True,
+        idempotentHint=True,
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def delete_forum_topic(
+    chat_id: Union[int, str],
+    topic_id: int,
+    account: Optional[str] = None,
+) -> str:
+    """
+    Delete a forum topic together with all of its messages. This cannot be undone.
+
+    The General topic (ID 1) cannot be deleted; close or hide it with edit_forum_topic.
+
+    Args:
+        chat_id: The forum-enabled supergroup ID or username.
+        topic_id: ID of the topic to delete.
+
+    Returns a JSON result with chat_id, topic_id and the number of request batches sent.
+    """
+    try:
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+
+        error = _forum_supergroup_error(entity)
+        if error:
+            return error
+
+        batches = 0
+        while batches < _DELETE_TOPIC_MAX_BATCHES:
+            result = await cl(
+                functions.messages.DeleteTopicHistoryRequest(peer=entity, top_msg_id=topic_id)
+            )
+            batches += 1
+            if not getattr(result, "offset", 0):
+                break
+        else:
+            return (
+                f"Topic {topic_id} is still being deleted after {batches} batches; "
+                "call delete_forum_topic again to continue."
+            )
+
+        record = {
+            "chat_id": get_marked_id(entity),
+            "topic_id": topic_id,
+            "deleted": True,
+            "batches": batches,
+        }
+        return format_tool_result([record])
+    except Exception as e:
+        return log_and_format_error("delete_forum_topic", e, chat_id=chat_id, topic_id=topic_id)
+
+
 @mcp.tool(annotations=ToolAnnotations(title="List Chats", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
 async def list_chats(
-    chat_type: str = None,
+    chat_type: Optional[str] = None,
     limit: int = 20,
     unread_only: bool = False,
     unmuted_only: bool = False,
-    archived: bool = None,
+    archived: Optional[bool] = None,
     with_about: bool = False,
-    account: str = None,
+    account: Optional[str] = None,
 ) -> str:
     """
     List available chats with metadata.
@@ -195,11 +634,18 @@ async def list_chats(
     try:
         cl = get_client(account)
         await ensure_connected(cl)
-        dialogs = await cl.get_dialogs(limit=limit, archived=archived)
+        try:
+            dialogs = await cl.get_dialogs(limit=limit, archived=archived)
+        except BotMethodInvalidError:
+            return "Listing chats is not supported for bot accounts (Telegram API restriction: bots cannot fetch dialog lists)."
 
         records = []
         for dialog in dialogs:
             entity = dialog.entity
+
+            # Enforce privacy allowlist
+            if is_chat_allowlist_enabled() and not is_chat_allowed(get_marked_id(entity), entity):
+                continue
 
             # Filter by type if requested
             current_type = get_entity_filter_type(entity)
@@ -279,10 +725,8 @@ async def list_chats(
                     elif isinstance(entity, User):
                         full = await cl(functions.users.GetFullUserRequest(id=entity))
                         about_text = getattr(full.full_user, "about", "") or ""
-                except Exception as about_err:
-                    logger.warning(
-                        f"list_chats: failed to fetch about for {entity.id}: {about_err}"
-                    )
+                except Exception:
+                    logger.warning("list_chats: failed to fetch one chat description")
                     about_text = "<error fetching description>"
 
                 record["about"] = sanitize_user_content(about_text, max_length=200)
@@ -310,7 +754,7 @@ async def list_chats(
 @mcp.tool(annotations=ToolAnnotations(title="Get Chat", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
 @validate_id("chat_id")
-async def get_chat(chat_id: Union[int, str], account: str = None) -> str:
+async def get_chat(chat_id: Union[int, str], account: Optional[str] = None) -> str:
     """
     Get detailed information about a specific chat.
 
@@ -322,6 +766,16 @@ async def get_chat(chat_id: Union[int, str], account: str = None) -> str:
     try:
         cl = get_client(account)
         entity = await resolve_entity(chat_id, cl)
+
+        if is_chat_allowlist_enabled() and not is_chat_allowed(chat_id, entity):
+            err = check_chat_access(chat_id, entity)
+            return log_and_format_error(
+                "get_chat",
+                ChatAccessDeniedError(err),
+                prefix=ErrorCategory.PRIVACY,
+                user_message=err,
+                chat_id=chat_id,
+            )
 
         record = {"id": get_marked_id(entity)}
 
@@ -353,32 +807,56 @@ async def get_chat(chat_id: Union[int, str], account: str = None) -> str:
             record["bot"] = bool(entity.bot)
             record["verified"] = bool(entity.verified)
 
-        # Get last activity if it's a dialog
+        # Photo presence — the entity carries ChatPhoto/ChatPhotoEmpty (chats/channels)
+        # or UserProfilePhoto/UserProfilePhotoEmpty (users). Surfaced so callers can
+        # detect chats that have no avatar set.
+        photo = getattr(entity, "photo", None)
+        record["has_photo"] = photo is not None and not isinstance(
+            photo, (types.ChatPhotoEmpty, types.UserProfilePhotoEmpty)
+        )
+        if record["has_photo"]:
+            record["current_avatar_id"] = getattr(photo, "photo_id", None)
+
+        # Get unread count + last activity for THIS specific peer.
+        #
+        # NOTE: do NOT use get_dialogs(limit=1, offset_peer=entity) here. In
+        # Telethon `offset_peer` is a pagination cursor, not a per-chat filter —
+        # with offset_id=0 it is effectively ignored, so limit=1 returns the
+        # account's top dialog and its unread/archived/last-message get wrongly
+        # attributed to the requested chat. GetPeerDialogsRequest resolves the
+        # dialog for exactly the requested peer instead.
         try:
-            # Using get_dialogs might be slow if there are many dialogs
-            # Alternative: Get entity again via get_dialogs if needed for unread count
-            dialog = await cl.get_dialogs(limit=1, offset_id=0, offset_peer=entity)
-            if dialog:
-                dialog = dialog[0]
-                record["unread"] = dialog.unread_count
-                record["archived"] = bool(getattr(dialog, "archived", False))
-                if dialog.message:
-                    last_msg = dialog.message
-                    sender_name = "Unknown"
-                    if last_msg.sender:
-                        sender_name = getattr(last_msg.sender, "first_name", "") or getattr(
-                            last_msg.sender, "title", "Unknown"
-                        )
-                        if hasattr(last_msg.sender, "last_name") and last_msg.sender.last_name:
-                            sender_name += f" {last_msg.sender.last_name}"
-                    sender_name = sanitize_name(sender_name.strip() or "Unknown")
-                    record["last_message"] = {
-                        "sender": sender_name,
-                        "date": last_msg.date,
-                        "text": sanitize_user_content(last_msg.message),
-                    }
-        except Exception as diag_ex:
-            logger.warning(f"Could not get dialog info for {chat_id}: {diag_ex}")
+            input_peer = await cl.get_input_entity(entity)
+            peer_dialogs = await cl(
+                functions.messages.GetPeerDialogsRequest(
+                    peers=[types.InputDialogPeer(peer=input_peer)]
+                )
+            )
+            if getattr(peer_dialogs, "dialogs", None):
+                dialog = peer_dialogs.dialogs[0]
+                record["unread"] = getattr(dialog, "unread_count", 0)
+                # folder_id == 1 is the Archive folder (None/0 == main list)
+                record["archived"] = getattr(dialog, "folder_id", 0) == 1
+
+            last_messages = await cl.get_messages(entity, limit=1)
+            if last_messages:
+                last_msg = last_messages[0]
+                sender_name = "Unknown"
+                sender = getattr(last_msg, "sender", None)
+                if sender:
+                    sender_name = getattr(sender, "first_name", "") or getattr(
+                        sender, "title", "Unknown"
+                    )
+                    if getattr(sender, "last_name", None):
+                        sender_name += f" {sender.last_name}"
+                sender_name = sanitize_name(sender_name.strip() or "Unknown")
+                record["last_message"] = {
+                    "sender": sender_name,
+                    "date": last_msg.date,
+                    "text": sanitize_user_content(last_msg.message),
+                }
+        except Exception:
+            logger.warning("Could not get requested dialog metadata")
 
         return format_tool_result([], metadata=record)
     except Exception as e:
@@ -389,7 +867,7 @@ async def get_chat(chat_id: Union[int, str], account: str = None) -> str:
     annotations=ToolAnnotations(title="Search Public Chats", openWorldHint=True, readOnlyHint=True)
 )
 @with_account(readonly=True)
-async def search_public_chats(query: str, limit: int = 20, account: str = None) -> str:
+async def search_public_chats(query: str, limit: int = 20, account: Optional[str] = None) -> str:
     """
     Search for public chats, channels, or bots by username or title.
     """
@@ -397,7 +875,10 @@ async def search_public_chats(query: str, limit: int = 20, account: str = None) 
         cl = get_client(account)
         await ensure_connected(cl)
         result = await cl(functions.contacts.SearchRequest(q=query, limit=limit))
-        entities = [format_entity(e) for e in result.chats + result.users]
+        all_entities = result.chats + result.users
+        if is_chat_allowlist_enabled():
+            all_entities = [e for e in all_entities if is_chat_allowed(get_marked_id(e), e)]
+        entities = [format_entity(e) for e in all_entities]
         return json.dumps(entities, indent=2)
     except Exception as e:
         return log_and_format_error("search_public_chats", e, query=query, limit=limit)
@@ -407,7 +888,7 @@ async def search_public_chats(query: str, limit: int = 20, account: str = None) 
     annotations=ToolAnnotations(title="Resolve Username", openWorldHint=True, readOnlyHint=True)
 )
 @with_account(readonly=True)
-async def resolve_username(username: str, account: str = None) -> str:
+async def resolve_username(username: str, account: Optional[str] = None) -> str:
     """
     Resolve a username to a user or chat ID.
     """
@@ -424,7 +905,8 @@ async def resolve_username(username: str, account: str = None) -> str:
     annotations=ToolAnnotations(title="Get Full Chat", openWorldHint=True, readOnlyHint=True)
 )
 @with_account(readonly=True)
-async def get_full_chat(chat_id: Union[int, str], account: str = None) -> str:
+@validate_id("chat_id")
+async def get_full_chat(chat_id: Union[int, str], account: Optional[str] = None) -> str:
     """
     Get full info of a channel or group including description/about text.
 
@@ -438,17 +920,45 @@ async def get_full_chat(chat_id: Union[int, str], account: str = None) -> str:
         cl = get_client(account)
         await ensure_connected(cl)
         entity = await resolve_entity(chat_id, cl)
-        full = await cl(functions.channels.GetFullChannelRequest(channel=entity))
+
+        if is_chat_allowlist_enabled() and not is_chat_allowed(chat_id, entity):
+            err = check_chat_access(chat_id, entity)
+            return log_and_format_error(
+                "get_full_chat",
+                ChatAccessDeniedError(err),
+                prefix=ErrorCategory.PRIVACY,
+                user_message=err,
+                chat_id=chat_id,
+            )
+
+        # Basic ("legacy") groups are not channels: GetFullChannelRequest cannot
+        # cast an InputPeerChat and raises TypeError. They are served by
+        # messages.GetFullChatRequest instead.
+        if isinstance(entity, (Chat, InputPeerChat)):
+            basic_id = getattr(entity, "chat_id", None) or getattr(entity, "id", None)
+            full = await cl(functions.messages.GetFullChatRequest(chat_id=basic_id))
+        else:
+            full = await cl(functions.channels.GetFullChannelRequest(channel=entity))
 
         chat = full.chats[0] if full.chats else None
         full_chat = full.full_chat
+
+        # Channels carry participants_count on the full object; basic groups only
+        # carry the member list, so count that instead.
+        participants_count = getattr(full_chat, "participants_count", None)
+        if participants_count is None:
+            members = getattr(getattr(full_chat, "participants", None), "participants", None)
+            if members is not None:
+                participants_count = len(members)
 
         result = {
             "id": get_marked_id(chat) if chat else None,
             "title": sanitize_name(getattr(chat, "title", None)) if chat else None,
             "username": getattr(chat, "username", None) if chat else None,
-            "about": sanitize_user_content(full_chat.about or "", max_length=1024),
-            "participants_count": getattr(full_chat, "participants_count", None),
+            "about": sanitize_user_content(
+                getattr(full_chat, "about", None) or "", max_length=1024
+            ),
+            "participants_count": participants_count,
             "linked_chat_id": getattr(full_chat, "linked_chat_id", None),
         }
 
@@ -464,7 +974,7 @@ async def get_full_chat(chat_id: Union[int, str], account: str = None) -> str:
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
-async def mute_chat(chat_id: Union[int, str], account: str = None) -> str:
+async def mute_chat(chat_id: Union[int, str], account: Optional[str] = None) -> str:
     """
     Mute notifications for a chat.
     """
@@ -495,10 +1005,8 @@ async def mute_chat(chat_id: Union[int, str], account: str = None) -> str:
             )
             return f"Chat {chat_id} muted (using alternative method)."
         except Exception as alt_e:
-            logger.exception(f"mute_chat (alt method) failed (chat_id={chat_id})")
             return log_and_format_error("mute_chat", alt_e, chat_id=chat_id)
     except Exception as e:
-        logger.exception(f"mute_chat failed (chat_id={chat_id})")
         return log_and_format_error("mute_chat", e, chat_id=chat_id)
 
 
@@ -509,7 +1017,7 @@ async def mute_chat(chat_id: Union[int, str], account: str = None) -> str:
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
-async def unmute_chat(chat_id: Union[int, str], account: str = None) -> str:
+async def unmute_chat(chat_id: Union[int, str], account: Optional[str] = None) -> str:
     """
     Unmute notifications for a chat.
     """
@@ -540,10 +1048,8 @@ async def unmute_chat(chat_id: Union[int, str], account: str = None) -> str:
             )
             return f"Chat {chat_id} unmuted (using alternative method)."
         except Exception as alt_e:
-            logger.exception(f"unmute_chat (alt method) failed (chat_id={chat_id})")
             return log_and_format_error("unmute_chat", alt_e, chat_id=chat_id)
     except Exception as e:
-        logger.exception(f"unmute_chat failed (chat_id={chat_id})")
         return log_and_format_error("unmute_chat", e, chat_id=chat_id)
 
 
@@ -554,7 +1060,7 @@ async def unmute_chat(chat_id: Union[int, str], account: str = None) -> str:
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
-async def archive_chat(chat_id: Union[int, str], account: str = None) -> str:
+async def archive_chat(chat_id: Union[int, str], account: Optional[str] = None) -> str:
     """
     Archive a chat.
     """
@@ -579,7 +1085,7 @@ async def archive_chat(chat_id: Union[int, str], account: str = None) -> str:
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
-async def unarchive_chat(chat_id: Union[int, str], account: str = None) -> str:
+async def unarchive_chat(chat_id: Union[int, str], account: Optional[str] = None) -> str:
     """
     Unarchive a chat.
     """
@@ -603,7 +1109,7 @@ async def unarchive_chat(chat_id: Union[int, str], account: str = None) -> str:
 @with_account(readonly=True)
 @validate_id("user_id")
 async def get_common_chats(
-    user_id: Union[int, str], limit: int = 100, max_id: int = 0, account: str = None
+    user_id: Union[int, str], limit: int = 100, max_id: int = 0, account: Optional[str] = None
 ) -> str:
     """
     List chats shared with a specific user.
@@ -646,9 +1152,6 @@ async def get_common_chats(
 
         return "\n".join(lines)
     except Exception as e:
-        logger.exception(
-            f"get_common_chats failed (user_id={user_id}, limit={limit}, max_id={max_id})"
-        )
         return log_and_format_error(
             "get_common_chats", e, user_id=user_id, limit=limit, max_id=max_id
         )
@@ -660,7 +1163,7 @@ async def get_common_chats(
 @with_account(readonly=True)
 @validate_id("chat_id")
 async def get_message_read_by(
-    chat_id: Union[int, str], message_id: int, account: str = None
+    chat_id: Union[int, str], message_id: int, account: Optional[str] = None
 ) -> str:
     """
     List user IDs who have read a specific message.
@@ -737,9 +1240,6 @@ async def get_message_read_by(
             default=json_serializer,
         )
     except Exception as e:
-        logger.exception(
-            f"get_message_read_by failed (chat_id={chat_id}, message_id={message_id})"
-        )
         return log_and_format_error(
             "get_message_read_by", e, chat_id=chat_id, message_id=message_id
         )
@@ -751,7 +1251,7 @@ async def get_message_read_by(
 @with_account(readonly=True)
 @validate_id("chat_id")
 async def get_message_link(
-    chat_id: Union[int, str], message_id: int, thread: bool = False, account: str = None
+    chat_id: Union[int, str], message_id: int, thread: bool = False, account: Optional[str] = None
 ) -> str:
     """
     Export a t.me/... link for a specific message.
@@ -793,10 +1293,6 @@ async def get_message_link(
             output += f"\nHTML: {html}"
         return output
     except Exception as e:
-        logger.exception(
-            f"get_message_link failed (chat_id={chat_id}, message_id={message_id}, "
-            f"thread={thread})"
-        )
         return log_and_format_error(
             "get_message_link",
             e,
@@ -809,6 +1305,8 @@ async def get_message_link(
 __all__ = [
     "get_chats",
     "list_topics",
+    "enable_forum_topics",
+    "create_forum_topic",
     "list_chats",
     "get_chat",
     "subscribe_public_channel",
