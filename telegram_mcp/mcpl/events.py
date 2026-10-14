@@ -28,10 +28,10 @@ from telethon.tl.types import (
     Channel,
     Chat,
     DocumentAttributeAudio,
-    MessageMediaDocument,
-    MessageMediaPhoto,
     MessageEntityMention,
     MessageEntityMentionName,
+    MessageMediaDocument,
+    MessageMediaPhoto,
     User,
 )
 
@@ -297,7 +297,9 @@ async def build_incoming_message(
     header = _build_speaker_header(author["name"], sender_username, metadata)
     content = _prepend_speaker_header(raw_content, header)
 
-    # Emit core tags and their umbrellas explicitly, as the other chat adapters do.
+    # The core chat:* tags, as discord-mcpl emits them: every message carries
+    # chat:addressed or chat:ambient, and a private chat carries chat:private
+    # beside chat:dm.
     tags: list[str] = []
     if is_mention:
         tags.append("chat:mention")
