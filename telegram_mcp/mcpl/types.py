@@ -94,6 +94,7 @@ class ChannelIncomingMessage(TypedDict, total=False):
     author: ChannelAuthor
     timestamp: str
     content: list[McplContentBlock]
+    tags: list[str]
     metadata: dict[str, Any]
 
 

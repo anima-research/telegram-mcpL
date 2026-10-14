@@ -2,7 +2,7 @@
 
 Wires `@client.on(events.NewMessage)` (and friends) for each configured
 TelegramClient. Each event is converted to a `ChannelIncomingMessage` with
-metadata rich enough to drive the host's `shouldTriggerInference` filter:
+MCPL `chat:*` tags for the host's addressing and wake filters, plus metadata:
 
   - botUserId, senderId, senderUsername
   - chatType, chatTitle
@@ -26,6 +26,9 @@ from telethon import TelegramClient, events
 from telethon.tl.types import (
     Channel,
     Chat,
+    DocumentAttributeAudio,
+    MessageMediaDocument,
+    MessageMediaPhoto,
     MessageEntityMention,
     MessageEntityMentionName,
     User,
@@ -278,12 +281,47 @@ async def build_incoming_message(
     header = _build_speaker_header(author["name"], sender_username, metadata)
     content = _prepend_speaker_header(raw_content, header)
 
+    # Emit core tags and their umbrellas explicitly, as the other chat adapters do.
+    tags: list[str] = []
+    if is_mention:
+        tags.append("chat:mention")
+    if metadata["isReplyToBot"]:
+        tags.append("chat:reply")
+    if metadata["isPrivate"]:
+        tags.extend(["chat:dm", "chat:private"])
+    addressed = is_mention or metadata["isReplyToBot"] or metadata["isPrivate"]
+    tags.append("chat:addressed" if addressed else "chat:ambient")
+    # Channel identities and unresolved senders don't reveal human/bot authorship.
+    if isinstance(sender, User):
+        tags.append("chat:from-bot" if sender.bot else "chat:from-human")
+    if thread_id is not None:
+        tags.append("chat:thread")
+
+    # Classify the attachment, even when content conversion used a placeholder.
+    media = getattr(message, "media", None)
+    if isinstance(media, MessageMediaPhoto):
+        tags.append("chat:has-image")
+    elif isinstance(media, MessageMediaDocument):
+        document = getattr(media, "document", None)
+        mime = (getattr(document, "mime_type", None) or "").lower()
+        is_voice = any(
+            isinstance(attr, DocumentAttributeAudio) and attr.voice
+            for attr in (getattr(document, "attributes", None) or [])
+        )
+        if mime.startswith("image/"):
+            tags.append("chat:has-image")
+        elif mime.startswith("audio/") or is_voice:
+            tags.append("chat:has-audio")
+        else:
+            tags.append("chat:has-file")
+
     incoming: ChannelIncomingMessage = {
         "channelId": descriptor["id"],
         "messageId": str(message.id),
         "author": author,
         "timestamp": timestamp,
         "content": content,
+        "tags": tags,
         "metadata": metadata,
     }
     if thread_id is not None:
