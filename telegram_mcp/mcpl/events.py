@@ -2,7 +2,7 @@
 
 Wires `@client.on(events.NewMessage)` (and friends) for each configured
 TelegramClient. Each event is converted to a `ChannelIncomingMessage` with
-metadata rich enough to drive the host's `shouldTriggerInference` filter:
+MCPL `chat:*` tags for the host's addressing and wake filters, plus metadata:
 
   - botUserId, senderId, senderUsername
   - chatType, chatTitle
@@ -23,11 +23,15 @@ from datetime import timezone
 from typing import TYPE_CHECKING, Any
 
 from telethon import TelegramClient, events
+from telethon.helpers import add_surrogate
 from telethon.tl.types import (
     Channel,
     Chat,
+    DocumentAttributeAudio,
     MessageEntityMention,
     MessageEntityMentionName,
+    MessageMediaDocument,
+    MessageMediaPhoto,
     User,
 )
 
@@ -158,7 +162,11 @@ def _has_username_mention(message: Any, username: str | None) -> bool:
     if not username:
         return False
     entities = getattr(message, "entities", None) or []
-    text = getattr(message, "message", "") or ""
+    # Entity offsets count UTF-16 code units: slice the text with each astral
+    # character as its surrogate pair, as Telethon's parsers do. The target is
+    # ASCII, so the slice is compared as it is, and one holding half of a pair
+    # (an entity that splits a character) simply doesn't match.
+    text = add_surrogate(getattr(message, "message", "") or "")
     target = f"@{username}".lower()
     for ent in entities:
         if isinstance(ent, MessageEntityMention):
@@ -217,16 +225,27 @@ async def build_incoming_message(
     if sender_username:
         metadata["senderUsername"] = sender_username
 
-    # Reply context — best-effort.
-    if getattr(message, "is_reply", False):
+    # Reply context — best-effort. In a forum topic, every post's reply header
+    # names the topic's root; only one that also carries reply_to_top_id
+    # replies to a message, the one reply_to_msg_id names.
+    reply_header = getattr(message, "reply_to", None)
+    is_topic_post = (
+        reply_header is not None
+        and getattr(reply_header, "forum_topic", False)
+        and getattr(reply_header, "reply_to_top_id", None) is None
+    )
+    if getattr(message, "is_reply", False) and not is_topic_post:
         metadata["isReply"] = True
-        reply_to = getattr(message, "reply_to", None)
-        reply_to_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to else None
+        reply_to_id = getattr(reply_header, "reply_to_msg_id", None) if reply_header else None
         if reply_to_id is not None:
             metadata["replyToMessageId"] = str(reply_to_id)
         try:
             replied = await message.get_reply_message()
-        except Exception:  # noqa: BLE001 — never block on reply lookup
+        except Exception as exc:  # noqa: BLE001 — never block on reply lookup
+            # The message is still delivered, but not as a reply to us.
+            log.error(
+                "Reply lookup failed for message %s in %s: %r", message.id, descriptor["id"], exc
+            )
             replied = None
         if replied is not None:
             replied_author_id = getattr(replied.sender_id, "user_id", None) or getattr(
@@ -278,12 +297,61 @@ async def build_incoming_message(
     header = _build_speaker_header(author["name"], sender_username, metadata)
     content = _prepend_speaker_header(raw_content, header)
 
+    # The core chat:* tags, as discord-mcpl emits them: every message carries
+    # chat:addressed or chat:ambient, and a private chat carries chat:private
+    # beside chat:dm.
+    #
+    # Telegram's mentioned flag also marks a reply to the account's own
+    # message, so it names an @-mention only on a message with no reply
+    # header. On a reply it still addresses the account, by a mention or by a
+    # reply to us, even when the reply lookup failed. A plain topic post's
+    # header names the topic's root, which may be the account's, so on that
+    # post the flag may mean no more than that, and isn't read.
+    flagged = bool(getattr(message, "mentioned", False))
+    at_mention = is_username_mention or is_explicit_mention or (flagged and reply_header is None)
+    flag_addresses = flagged and not is_topic_post
+    tags: list[str] = []
+    if at_mention:
+        tags.append("chat:mention")
+    if metadata["isReplyToBot"]:
+        tags.append("chat:reply")
+    if metadata["isPrivate"]:
+        tags.extend(["chat:dm", "chat:private"])
+    addressed = at_mention or flag_addresses or metadata["isReplyToBot"] or metadata["isPrivate"]
+    tags.append("chat:addressed" if addressed else "chat:ambient")
+    # Channel identities and unresolved senders don't reveal human/bot authorship.
+    if isinstance(sender, User):
+        tags.append("chat:from-bot" if sender.bot else "chat:from-human")
+    if thread_id is not None:
+        tags.append("chat:thread")
+
+    # Classify the attachment, even when content conversion used a placeholder.
+    media = getattr(message, "media", None)
+    if isinstance(media, MessageMediaPhoto):
+        tags.append("chat:has-image")
+    elif isinstance(media, MessageMediaDocument):
+        document = getattr(media, "document", None)
+        mime = (getattr(document, "mime_type", None) or "").lower()
+        # Telegram marks voice notes and music alike with DocumentAttributeAudio,
+        # whatever MIME type the sender's client gave the bytes.
+        is_audio = any(
+            isinstance(attr, DocumentAttributeAudio)
+            for attr in (getattr(document, "attributes", None) or [])
+        )
+        if mime.startswith("image/"):
+            tags.append("chat:has-image")
+        elif mime.startswith("audio/") or is_audio:
+            tags.append("chat:has-audio")
+        else:
+            tags.append("chat:has-file")
+
     incoming: ChannelIncomingMessage = {
         "channelId": descriptor["id"],
         "messageId": str(message.id),
         "author": author,
         "timestamp": timestamp,
         "content": content,
+        "tags": tags,
         "metadata": metadata,
     }
     if thread_id is not None:
