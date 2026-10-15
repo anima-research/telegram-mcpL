@@ -20,6 +20,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from . import push
 from .policy import PolicyState, host_speaks_0_5
 from .channels import note_registered
 from .transport import McplTransport
@@ -54,6 +55,7 @@ def make_on_ready(
     """
 
     async def on_ready(transport: McplTransport) -> None:
+        push.bind(transport, policy)  # every push still checks the live grant
         if host_speaks_0_5(transport.host_capabilities):
             answered = await policy.wait_ready(policy_wait_seconds)
             if not answered:

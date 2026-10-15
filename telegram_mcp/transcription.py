@@ -709,6 +709,107 @@ async def transcribe_cached(
         return out
 
 
+# A tool call has to answer before the server's own tool timeout
+# (TELEGRAM_TOOL_TIMEOUT_SECONDS, 55s by default) and the client's, but a long
+# recording on a CPU engine can take many minutes. So a transcription runs as
+# a task that outlives the call: the call waits up to
+# TELEGRAM_TRANSCRIBE_WAIT_SECONDS and then reports "running"; the task
+# finishes and caches its result. When a caller was told "running", the result
+# is also pushed to the host as a push/event (feature set telegram.transcripts)
+# so the agent need not poll; a repeat call returns the cached text either way.
+TRANSCRIBE_WAIT_DEFAULT_SECONDS = 40.0
+
+_BACKGROUND: dict = {}
+
+
+def _wait_seconds() -> float:
+    return _env_float("TELEGRAM_TRANSCRIBE_WAIT_SECONDS", TRANSCRIBE_WAIT_DEFAULT_SECONDS)
+
+
+def _late_result_text(chat_id: int, message_id, result: dict) -> str:
+    where = f"voice message_id {message_id} in chat {chat_id}"
+    status = result.get("status")
+    if status == "ok":
+        meta = ", ".join(
+            x
+            for x in (
+                format_duration(result.get("duration")) if result.get("duration") else None,
+                result.get("lang"),
+                result.get("source"),
+            )
+            if x
+        )
+        return (
+            f"Transcript of {where} ({meta}; machine transcript, not a verbatim quote):\n\n"
+            f"{result.get('text', '')}"
+        )
+    if status == "error":
+        detail = result.get("error", "unknown error")
+    elif status == "exception":
+        detail = result.get("error", "unexpected error")
+    else:
+        detail = status
+    return (
+        f"Transcription of {where} failed: {detail}. "
+        "transcribe_voice with the same arguments tries again."
+    )
+
+
+async def _deliver_late(key, entry: dict, task) -> None:
+    from telegram_mcp.mcpl import push  # MCPL layer imports tools; keep this lazy
+
+    if task.cancelled():
+        return
+    exc = task.exception()
+    result = {"status": "exception", "error": str(exc)} if exc else task.result()
+    chat_id, message_id, engine = key
+    await push.push_text(
+        f"transcript:{chat_id}:{message_id}:{engine}:{entry['started']:.0f}",
+        _late_result_text(chat_id, message_id, result),
+        {"source": "telegram", "kind": "transcript", "chatId": chat_id, "messageId": message_id},
+    )
+
+
+def _finished(key, entry: dict, task) -> None:
+    if _BACKGROUND.get(key) is entry:
+        _BACKGROUND.pop(key, None)
+    if not task.cancelled():
+        task.exception()  # retrieved, so an unawaited failure isn't logged as lost
+    if entry["deferred"]:
+        entry["delivery"] = asyncio.ensure_future(_deliver_late(key, entry, task))
+
+
+async def transcribe_background(
+    cl, entity, msg, engine: str, chat_id: int, duration: Optional[int] = None
+) -> dict:
+    """:func:`transcribe_cached` that answers within the wait budget.
+
+    Same status dicts, plus ``{"status": "running", "elapsed": seconds,
+    "push": bool}`` when the transcription is still going; ``push`` says whether
+    the result will arrive as a push/event. A repeat call for the same
+    recording and engine joins the running task instead of starting another.
+    """
+    from telegram_mcp.mcpl import push
+
+    key = (chat_id, getattr(msg, "id", None), engine)
+    entry = _BACKGROUND.get(key)
+    if entry is None:
+        task = asyncio.create_task(
+            transcribe_cached(cl, entity, msg, engine, chat_id, duration=duration)
+        )
+        entry = {"task": task, "started": asyncio.get_running_loop().time(), "deferred": False}
+        _BACKGROUND[key] = entry
+        task.add_done_callback(lambda t, e=entry: _finished(key, e, t))
+    try:
+        return await asyncio.wait_for(asyncio.shield(entry["task"]), _wait_seconds())
+    except asyncio.TimeoutError:
+        entry["deferred"] = True
+        return {
+            "status": "running",
+            "elapsed": round(asyncio.get_running_loop().time() - entry["started"]),
+            "push": push.available(),
+        }
+
 # ---------------------------------------------------------------------------
 # Batch budget for auto-mixing (mode="auto" only)
 # ---------------------------------------------------------------------------

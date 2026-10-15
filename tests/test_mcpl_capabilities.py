@@ -17,8 +17,9 @@ def test_mcpl_version_pinned():
 def test_capabilities_shape():
     caps = build_mcpl_capabilities()
     assert caps["version"] == "0.5"
-    # never emitted → not advertised (§6.4 honesty)
-    assert caps["pushEvents"] is False
+    # emitted only for late transcripts (telegram.transcripts)
+    assert caps["pushEvents"] is True
+    assert caps["featureSets"]["telegram.transcripts"]["uses"] == ["pushEvents"]
     assert caps["channels"] == {
         "register": True,
         "publish": True,

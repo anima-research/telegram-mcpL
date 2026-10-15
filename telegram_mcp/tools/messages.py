@@ -1423,8 +1423,9 @@ async def transcribe_voice(
 
         duration = transcription.voice_duration(msg)
         # Cache-first and locked by (chat, message, engine): two concurrent
-        # calls for the same recording pay the engine once, not twice.
-        result = await transcription.transcribe_cached(
+        # calls for the same recording pay the engine once, not twice. A long
+        # one keeps running after this call returns "running".
+        result = await transcription.transcribe_background(
             cl, entity, msg, chosen_engine, numeric_chat_id, duration=duration
         )
 
@@ -1437,6 +1438,25 @@ async def transcribe_voice(
                     "reason": "pending",
                     "duration": duration,
                     "detail": "Telegram is still processing this recording. Retry shortly.",
+                },
+                ensure_ascii=False,
+            )
+        if result["status"] == "running":
+            return json.dumps(
+                {
+                    "transcribed": False,
+                    "reason": "running",
+                    "duration": duration,
+                    "elapsed": result["elapsed"],
+                    "detail": (
+                        "Still transcribing in the background. The transcript will "
+                        "arrive as a separate event when it is done; no need to call "
+                        "again."
+                        if result.get("push")
+                        else "Still transcribing in the background; the text is kept. "
+                        "Call transcribe_voice again later with the same arguments "
+                        "to get it."
+                    ),
                 },
                 ensure_ascii=False,
             )

@@ -15,17 +15,23 @@ from __future__ import annotations
 from typing import Any
 
 from . import MCPL_VERSION
-from .policy import FS_DESCRIPTION, FS_NAME, FS_USES
+from .policy import (
+    FS_DESCRIPTION,
+    FS_NAME,
+    FS_TRANSCRIPTS_DESCRIPTION,
+    FS_TRANSCRIPTS_NAME,
+    FS_TRANSCRIPTS_USES,
+    FS_USES,
+)
 
 
 def build_mcpl_capabilities() -> dict[str, Any]:
     """Return the dict to inject as `experimental.mcpl` on `initialize`."""
     return {
         "version": MCPL_VERSION,
-        # This server never emits push/event — Telegram traffic arrives as
-        # channels/incoming (§14). Advertising only what is exercised keeps
-        # the grant honest (§6.4).
-        "pushEvents": False,
+        # Telegram traffic arrives as channels/incoming (§14); push/event
+        # carries only late transcripts (telegram.transcripts).
+        "pushEvents": True,
         "channels": {
             "register": True,
             "publish": True,
@@ -41,7 +47,11 @@ def build_mcpl_capabilities() -> dict[str, Any]:
             FS_NAME: {
                 "description": FS_DESCRIPTION,
                 "uses": list(FS_USES),
-            }
+            },
+            FS_TRANSCRIPTS_NAME: {
+                "description": FS_TRANSCRIPTS_DESCRIPTION,
+                "uses": list(FS_TRANSCRIPTS_USES),
+            },
         },
     }
 

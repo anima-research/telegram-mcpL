@@ -8,6 +8,7 @@ unmodified, which is the backward-compatibility contract these tests pin down
 explicitly for the voice case.
 """
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -525,3 +526,160 @@ async def test_transcribe_voice_openai_caches_under_its_own_engine(
     assert result["text"] == "openai text"
     assert result["source"] == "openai"
     assert transcription.get_cached_transcript(1, 5, source="openai")["text"] == "openai text"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_voice_long_run_continues_in_background(
+    monkeypatch, transcript_cache_dir
+):
+    """A transcription that outlasts the wait budget reports "running", keeps
+    going after the call returns, caches its text, and a later call returns it
+    without a second engine run."""
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WAIT_SECONDS", "0.05")
+    entity = SimpleNamespace()
+    client = _FakeClient(messages_by_id={5: _voice_msg(id=5)})
+    _patch_client(monkeypatch, client, entity, 1)
+    release = asyncio.Event()
+    calls = []
+
+    async def slow_transcribe(*args, **kwargs):
+        calls.append(1)
+        await release.wait()
+        return {"status": "ok", "text": "long one", "lang": "ru"}
+
+    monkeypatch.setattr(transcription, "transcribe", slow_transcribe)
+
+    first = json.loads(
+        await messages.transcribe_voice(chat_id=1, message_id=5, engine="telegram", account=None)
+    )
+    assert first["transcribed"] is False
+    assert first["reason"] == "running"
+    second = json.loads(
+        await messages.transcribe_voice(chat_id=1, message_id=5, engine="telegram", account=None)
+    )
+    assert second["reason"] == "running"
+    assert transcription.get_cached_transcript(1, 5) is None
+
+    release.set()
+    for _ in range(100):
+        if not transcription._BACKGROUND:
+            break
+        await asyncio.sleep(0.01)
+    assert transcription.get_cached_transcript(1, 5)["text"] == "long one"
+
+    third = json.loads(
+        await messages.transcribe_voice(chat_id=1, message_id=5, engine="telegram", account=None)
+    )
+    assert third["transcribed"] is True
+    assert third["text"] == "long one"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_transcribe_voice_late_result_is_pushed(monkeypatch, transcript_cache_dir):
+    """With push/event available, a caller told "running" needn't poll: the
+    finished transcript is pushed once, with the message id in it."""
+    from telegram_mcp.mcpl import push
+
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WAIT_SECONDS", "0.05")
+    entity = SimpleNamespace()
+    client = _FakeClient(messages_by_id={8: _voice_msg(id=8)})
+    _patch_client(monkeypatch, client, entity, 1)
+    release = asyncio.Event()
+    pushed = []
+
+    async def slow_transcribe(*args, **kwargs):
+        await release.wait()
+        return {"status": "ok", "text": "довга розповідь", "lang": "uk"}
+
+    async def fake_push(event_id, text, origin):
+        pushed.append((event_id, text, origin))
+        return True
+
+    monkeypatch.setattr(transcription, "transcribe", slow_transcribe)
+    monkeypatch.setattr(push, "available", lambda: True)
+    monkeypatch.setattr(push, "push_text", fake_push)
+
+    first = json.loads(
+        await messages.transcribe_voice(chat_id=1, message_id=8, engine="telegram", account=None)
+    )
+    assert first["reason"] == "running"
+    assert "no need to call again" in first["detail"]
+
+    release.set()
+    for _ in range(100):
+        if pushed:
+            break
+        await asyncio.sleep(0.01)
+    assert len(pushed) == 1
+    event_id, text, origin = pushed[0]
+    assert event_id.startswith("transcript:1:8:telegram:")
+    assert "message_id 8" in text and "довга розповідь" in text
+    assert "not a verbatim quote" in text
+    assert origin["messageId"] == 8
+    assert transcription.get_cached_transcript(1, 8)["text"] == "довга розповідь"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_voice_late_failure_is_pushed(monkeypatch, transcript_cache_dir):
+    from telegram_mcp.mcpl import push
+
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WAIT_SECONDS", "0.05")
+    entity = SimpleNamespace()
+    client = _FakeClient(messages_by_id={9: _voice_msg(id=9)})
+    _patch_client(monkeypatch, client, entity, 1)
+    release = asyncio.Event()
+    pushed = []
+
+    async def slow_fail(*args, **kwargs):
+        await release.wait()
+        return {"status": "error", "error": "HTTP 500 from engine"}
+
+    async def fake_push(event_id, text, origin):
+        pushed.append(text)
+        return True
+
+    monkeypatch.setattr(transcription, "transcribe", slow_fail)
+    monkeypatch.setattr(push, "available", lambda: True)
+    monkeypatch.setattr(push, "push_text", fake_push)
+
+    await messages.transcribe_voice(chat_id=1, message_id=9, engine="telegram", account=None)
+    release.set()
+    for _ in range(100):
+        if pushed:
+            break
+        await asyncio.sleep(0.01)
+    assert pushed and "failed: HTTP 500 from engine" in pushed[0]
+    assert transcription.get_cached_transcript(1, 9) is None
+
+
+@pytest.mark.asyncio
+async def test_push_text_needs_grant():
+    from telegram_mcp.mcpl import push
+    from telegram_mcp.mcpl.policy import FS_USES, PolicyState
+
+    class _T:
+        def __init__(self):
+            self.sent = []
+
+        async def request(self, method, params):
+            self.sent.append((method, params))
+            return {"accepted": True}
+
+    t = _T()
+    policy = PolicyState()
+    policy.apply({"effectiveCapabilities": list(FS_USES)}, is_request=True)
+    push.bind(t, policy)
+    try:
+        assert await push.push_text("e1", "hi", {}) is False and not t.sent
+        policy.apply({"effectiveCapabilities": list(FS_USES) + ["pushEvents"]}, is_request=True)
+        assert await push.push_text("e2", "hi", {"kind": "transcript"}) is True
+        method, params = t.sent[0]
+        assert method == "push/event"
+        assert params["featureSet"] == "telegram.transcripts"
+        assert params["payload"]["content"] == [{"type": "text", "text": "hi"}]
+    finally:
+        push.bind(None, None)
