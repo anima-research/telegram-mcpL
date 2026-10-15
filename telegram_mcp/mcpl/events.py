@@ -35,7 +35,14 @@ from telethon.tl.types import (
     User,
 )
 
-from .channels import channel_id_for, entity_to_descriptor
+from .access import chat_allowed
+from .channels import (
+    channel_id_for,
+    entity_to_descriptor,
+    is_registered,
+    note_registered,
+    note_unregistered,
+)
 from .content import message_to_content_blocks
 from .types import ChannelIncomingMessage
 
@@ -192,6 +199,10 @@ async def build_incoming_message(
     chat = await event.get_chat()
     descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
     if descriptor is None:
+        return None
+    # TELEGRAM_ALLOWED_CHAT_IDS, checked against the entity so @username entries
+    # match too; before any media is downloaded.
+    if not chat_allowed(getattr(event, "chat_id", None), chat):
         return None
 
     sender = await event.get_sender()
@@ -393,6 +404,9 @@ async def _build_chat_action_payload(
         return None
 
     chat = await event.get_chat()
+    # A chat outside TELEGRAM_ALLOWED_CHAT_IDS isn't disclosed to the host, joined or left.
+    if not chat_allowed(getattr(event, "chat_id", None), chat):
+        return None
     if user_left or user_kicked:
         descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
         if descriptor is None:
@@ -404,6 +418,25 @@ async def _build_chat_action_payload(
             return None
         return {"added": [descriptor]}
     return None
+
+
+async def register_if_new(
+    transport: McplTransport,
+    chat: Any,
+    *,
+    account_label: str,
+    self_id: int,
+) -> None:
+    """Announce a chat the host hasn't been told about (channels/changed added).
+
+    Called before pushing an incoming message: a chat missing from the startup
+    registration would otherwise be dropped by hosts that require registration.
+    """
+    descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
+    if descriptor is None or is_registered(descriptor["id"]):
+        return
+    await transport.send_notification("channels/changed", {"added": [descriptor]})
+    note_registered([descriptor["id"]])
 
 
 async def attach_event_handlers(
@@ -466,6 +499,19 @@ async def attach_event_handlers(
                     policy.fs_enabled,
                 )
                 return
+            if (policy is None or policy.can_register) and not is_registered(payload["channelId"]):
+                # Best effort: a failed registration must not cost the message itself.
+                try:
+                    await register_if_new(
+                        transport,
+                        await event.get_chat(),
+                        account_label=account_label,
+                        self_id=self_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.warning(
+                        "could not register %s before its first message", payload["channelId"]
+                    )
             await transport.send_notification("channels/incoming", {"messages": [payload]})
         except Exception:
             log.exception("Failed to push NewMessage event")
@@ -482,6 +528,8 @@ async def attach_event_handlers(
                 log.info("channels/changed suppressed — channels.register not granted")
                 return
             await transport.send_notification("channels/changed", payload)
+            note_registered(d["id"] for d in payload.get("added", []))
+            note_unregistered(payload.get("removed", []))
         except Exception:
             log.exception("Failed to push ChatAction event")
 

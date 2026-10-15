@@ -334,7 +334,7 @@ async def test_speaker_header_with_media_only():
     # The first text block was the [photo] placeholder; header should be
     # prepended to it.
     assert any("Alice (@alice):" in b.get("text", "") for b in text_blocks)
-    assert any("[photo]" in b.get("text", "") for b in text_blocks)
+    assert any("[photo, message_id 100]" in b.get("text", "") for b in text_blocks)
 
 
 class FakeChatActionEvent:

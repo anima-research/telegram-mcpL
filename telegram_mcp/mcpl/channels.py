@@ -24,8 +24,10 @@ import logging
 from typing import Any
 
 from telethon import TelegramClient
+from telethon.errors import BotMethodInvalidError
 from telethon.tl.types import Channel, Chat, User
 
+from .access import allowlist_enabled, allowlist_entries, chat_allowed
 from .types import ChannelDescriptor
 
 log = logging.getLogger("telegram_mcp.mcpl")
@@ -99,6 +101,30 @@ def _label_for(entity: Any, kind: str) -> str:
 # ---------------------------------------------------------------------------
 # Public mapping
 # ---------------------------------------------------------------------------
+
+
+# Channel ids the host has been told about (channels/register at startup,
+# channels/changed since). A chat that couldn't be enumerated at startup (a
+# bot's cold supergroup, a user account's brand-new DM) is registered on its
+# first incoming message instead of being dropped by the host as unknown.
+_registered_ids: set[str] = set()
+
+
+def note_registered(ids) -> None:
+    _registered_ids.update(ids)
+
+
+def note_unregistered(ids) -> None:
+    _registered_ids.difference_update(ids)
+
+
+def is_registered(channel_id: str) -> bool:
+    return channel_id in _registered_ids
+
+
+def reset_registered() -> None:
+    """Test helper."""
+    _registered_ids.clear()
 
 
 def channel_id_for(account_label: str, kind: str, peer_id: int | str) -> str:
@@ -180,16 +206,23 @@ async def enumerate_channels(
 
     descriptors: list[ChannelDescriptor] = []
     saw_saved = False
+    gated = allowlist_enabled()
 
-    async for dialog in client.iter_dialogs():
-        descriptor = entity_to_descriptor(
-            dialog.entity, account_label=account_label, self_id=self_id
-        )
-        if descriptor is None:
-            continue
-        if descriptor["metadata"]["kind"] == "saved":
-            saw_saved = True
-        descriptors.append(descriptor)
+    try:
+        async for dialog in client.iter_dialogs():
+            descriptor = entity_to_descriptor(
+                dialog.entity, account_label=account_label, self_id=self_id
+            )
+            if descriptor is None:
+                continue
+            if descriptor["metadata"]["kind"] == "saved":
+                saw_saved = True
+            elif gated and not chat_allowed(descriptor["address"]["peerId"], dialog.entity):
+                continue
+            descriptors.append(descriptor)
+    except BotMethodInvalidError:
+        # A bot can't list dialogs: its channels are the allowlisted chats.
+        return await _allowlisted_channels(client, account_label)
 
     # Saved Messages may not always appear as a dialog. If we missed it,
     # synthesize a descriptor since `client.send_message('me', ...)` works
@@ -218,4 +251,47 @@ async def enumerate_channels(
         len(descriptors),
         account_label,
     )
+    return descriptors
+
+
+async def _allowlisted_channels(
+    client: TelegramClient,
+    account_label: str,
+) -> list[ChannelDescriptor]:
+    """Channels for an account that can't list dialogs (a bot).
+
+    Each TELEGRAM_ALLOWED_CHAT_IDS entry is resolved; a user id the account
+    hasn't met yet registers as a DM by id, so the first message from that
+    user is accepted. Other unresolvable entries are skipped. Without an
+    allowlist nothing is registered.
+    """
+    entries = allowlist_entries()
+    if not entries:
+        log.warning(
+            "account '%s' can't list dialogs and TELEGRAM_ALLOWED_CHAT_IDS is unset: "
+            "no channels registered",
+            account_label,
+        )
+        return []
+    descriptors: list[ChannelDescriptor] = []
+    seen: set[str] = set()
+    for entry in entries:
+        descriptor = None
+        try:
+            entity = await client.get_entity(entry)
+            descriptor = entity_to_descriptor(entity, account_label=account_label)
+        except Exception as exc:  # noqa: BLE001 - not met yet, or not resolvable
+            log.info("allowlisted chat %r not resolvable yet (%s)", entry, exc)
+        if descriptor is None and isinstance(entry, int) and entry > 0:
+            descriptor = {
+                "id": channel_id_for(account_label, "dm", entry),
+                "type": "telegram",
+                "label": f"user:{entry}",
+                "direction": "bidirectional",
+                "address": {"account": account_label, "kind": "dm", "peerId": entry},
+                "metadata": {"account": account_label, "kind": "dm"},
+            }
+        if descriptor is not None and descriptor["id"] not in seen:
+            seen.add(descriptor["id"])
+            descriptors.append(descriptor)
     return descriptors
