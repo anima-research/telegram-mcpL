@@ -8,6 +8,7 @@ without storing session files.
 
 Usage:
     python session_string_generator.py
+    python session_string_generator.py --qr
 
 Requirements:
     - telethon
@@ -19,18 +20,43 @@ parameters support integer IDs, string representations of IDs (e.g., "123456"),
 and usernames (e.g., "@mychannel").
 """
 
+import argparse
 import asyncio
+import getpass
 import io
 import os
 import sys
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from telethon import errors
 from telethon.sessions import StringSession
 from telethon.sync import TelegramClient
+from telegram_mcp.client_identity import client_identity_kwargs
 from telegram_mcp.install_guard import UnsafeInstallationError, assert_safe_distribution
 
+# How many times the QR code is regenerated after expiry before giving up.
+_QR_MAX_REFRESHES = 10
+
 load_dotenv()
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate a Telegram session string for telegram-mcp."
+    )
+    login_group = parser.add_mutually_exclusive_group()
+    login_group.add_argument(
+        "--qr",
+        action="store_true",
+        help="Use Telegram QR login without prompting for a login method.",
+    )
+    login_group.add_argument(
+        "--phone",
+        action="store_true",
+        help="Use phone number + verification code login without prompting for a login method.",
+    )
+    return parser.parse_args()
 
 
 def _check_installation() -> None:
@@ -41,10 +67,34 @@ def _check_installation() -> None:
         sys.exit(1)
 
 
-def _qr_login(client: TelegramClient) -> None:
-    import qrcode
+def _stream_can_encode(text: str, stream) -> bool:
+    """True if *stream* can write *text* without raising UnicodeEncodeError."""
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        text.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
 
-    qr = client.qr_login()
+
+def _harden_stdio() -> None:
+    """Replace unencodable output instead of crashing mid-login.
+
+    On Windows, redirected stdout falls back to the legacy ANSI code page
+    (e.g. cp1252), which cannot encode the QR block characters or non-latin
+    text, so a bare print() raises UnicodeEncodeError and aborts the login.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def _render_qr(qr) -> None:
+    import qrcode
 
     print("\n----- QR Code Login -----\n")
 
@@ -53,23 +103,57 @@ def _qr_login(client: TelegramClient) -> None:
     qr_obj.make(fit=True)
     f = io.StringIO()
     qr_obj.print_ascii(out=f, invert=True)
-    print(f.getvalue())
+    art = f.getvalue()
 
-    print("Scan the QR code above with your Telegram app:")
-    print("  Open Telegram > Settings > Devices > Link Desktop Device\n")
-    print(f"Or open this link on a device where you're logged in:\n  {qr.url}\n")
+    if _stream_can_encode(art, sys.stdout):
+        print(art)
+        print("Scan the QR code above with your Telegram app:")
+        print("  Open Telegram > Settings > Devices > Link Desktop Device\n")
+        print(f"Or open this link on a device where you're logged in:\n  {qr.url}\n")
+    else:
+        encoding = getattr(sys.stdout, "encoding", None) or "unknown"
+        print(f"This console ({encoding}) cannot draw the QR code.")
+        print(f"Open this link on a device where you're logged in instead:\n  {qr.url}\n")
+
     print(f"Expires at: {qr.expires.strftime('%H:%M:%S')}")
     print("Waiting for you to scan...")
 
-    try:
-        client.loop.run_until_complete(qr.wait(timeout=120))
-    except asyncio.TimeoutError:
-        print("\nQR code expired. Please try again.")
-        client.disconnect()
-        sys.exit(1)
-    except errors.SessionPasswordNeededError:
-        pw = input("\nTwo-factor authentication enabled. Please enter your password: ")
-        client.sign_in(password=pw)
+
+def _seconds_until_expiry(qr) -> float:
+    """Seconds left before this QR token expires, with a small safety margin."""
+    expires = qr.expires
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    remaining = (expires - datetime.now(timezone.utc)).total_seconds()
+    return max(1.0, remaining - 1.0)
+
+
+def _qr_login(client: TelegramClient) -> None:
+    qr = client.qr_login()
+    _render_qr(qr)
+
+    for _ in range(_QR_MAX_REFRESHES):
+        try:
+            client.loop.run_until_complete(qr.wait(timeout=_seconds_until_expiry(qr)))
+            return
+        except asyncio.TimeoutError:
+            client.loop.run_until_complete(qr.recreate())
+            print("\nQR code expired, here is a fresh one.")
+            _render_qr(qr)
+        except errors.SessionPasswordNeededError:
+            while True:
+                pw = getpass.getpass(
+                    "\nTwo-factor authentication enabled. Please enter your password: "
+                )
+                try:
+                    client.sign_in(password=pw)
+                    return
+                except errors.PasswordHashInvalidError:
+                    print("Invalid password, please try again.")
+
+    print("\nQR code expired too many times. Please run the generator again.")
+    client.disconnect()
+    sys.exit(1)
 
 
 def _phone_login(client: TelegramClient) -> None:
@@ -94,11 +178,13 @@ def _phone_login(client: TelegramClient) -> None:
     try:
         client.sign_in(phone, code)
     except errors.SessionPasswordNeededError:
-        pw = input("Two-factor authentication enabled. Please enter your password: ")
+        pw = getpass.getpass("Two-factor authentication enabled. Please enter your password: ")
         client.sign_in(password=pw)
 
 
 def main() -> None:
+    _harden_stdio()
+    args = _parse_args()
     _check_installation()
 
     API_ID = os.getenv("TELEGRAM_API_ID")
@@ -122,19 +208,28 @@ def main() -> None:
         "\nYour credentials will NOT be stored on any server and are only used for local authentication.\n"
     )
 
-    label = (
-        input("Account label (optional, e.g. 'work', 'personal'; leave empty for default): ")
-        .strip()
-        .lower()
-    )
+    try:
+        label = (
+            input("Account label (optional, e.g. 'work', 'personal'; leave empty for default): ")
+            .strip()
+            .lower()
+        )
+    except EOFError:
+        # Non-interactive stdin (piped/scripted runs): fall back to the default label.
+        label = ""
 
-    print("\nChoose login method:")
-    print("  1) QR code login (recommended -- scan from your Telegram app)")
-    print("  2) Phone number + verification code")
-    method = input("\nEnter 1 or 2 [default: 1]: ").strip() or "1"
+    if args.qr:
+        method = "1"
+    elif args.phone:
+        method = "2"
+    else:
+        print("\nChoose login method:")
+        print("  1) QR code login (recommended -- scan from your Telegram app)")
+        print("  2) Phone number + verification code")
+        method = input("\nEnter 1 or 2 [default: 1]: ").strip() or "1"
 
     try:
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        client = TelegramClient(StringSession(), API_ID, API_HASH, **client_identity_kwargs())
         client.connect()
 
         if not client.is_user_authorized():
@@ -157,12 +252,17 @@ def main() -> None:
         print(f"{env_var}={session_string}")
         print("\nIMPORTANT: Keep this string private and never share it with anyone!")
 
-        choice = input(
-            "\nWould you like to automatically update your .env file with this session string? (y/N): "
-        )
+        try:
+            choice = input(
+                "\nWould you like to automatically update your .env file with this session string? (y/N): "
+            )
+        except EOFError:
+            choice = "n"
         if choice.lower() == "y":
             try:
-                with open(".env", "r") as file:
+                # python-dotenv reads .env as UTF-8; the locale default
+                # (cp1252, cp1251, cp936 on Windows) can't decode it.
+                with open(".env", "r", encoding="utf-8") as file:
                     env_contents = file.readlines()
 
                 session_string_line_found = False
@@ -175,7 +275,7 @@ def main() -> None:
                 if not session_string_line_found:
                     env_contents.append(f"{env_var}={session_string}\n")
 
-                with open(".env", "w") as file:
+                with open(".env", "w", encoding="utf-8") as file:
                     file.writelines(env_contents)
 
                 print("\n.env file updated successfully!")

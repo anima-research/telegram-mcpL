@@ -10,6 +10,8 @@ from telegram_mcp.tools.groups import *
 from telegram_mcp.tools.media import *
 from telegram_mcp.tools.profile import *
 from telegram_mcp.tools.folders import *
+from telegram_mcp.tools.events import *
+from telegram_mcp.tools.custom_emoji import *
 
 # MCPL RFC-008: tag every registered tool with its class (see tool_classes.py).
 _apply_tool_classes(_mcp)

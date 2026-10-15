@@ -232,8 +232,12 @@ async def message_to_content_blocks(
     Text is emitted as a text block. Images and small text files are
     downloaded and inlined (base64 image / decoded text) so the model can
     perceive them directly. Any other media — or media too large to inline —
-    degrades to a `[<kind>]` placeholder plus a McplResourceContent pointing
-    at the message URI, which the agent can follow with the media tools.
+    degrades to a `[<kind>, message_id <id>]` placeholder plus a
+    McplResourceContent pointing at the message URI. The id is in the text
+    because hosts render content, not the event's messageId, and a host that
+    can't resolve the resource URI would otherwise leave the agent no way to
+    name the message for download_media / transcribe_voice. Captioned media
+    gets the placeholder too.
     """
     blocks: list[McplContentBlock] = []
     text = getattr(message, "message", None) or ""
@@ -247,10 +251,11 @@ async def message_to_content_blocks(
         if rich is not None:
             blocks.append(rich)
         else:
-            # Couldn't inline — surface a placeholder (if there's no caption)
-            # and the resource pointer so the agent can fetch on demand.
-            if not text:
-                blocks.append(McplTextContent(type="text", text=f"[{kind}]"))
+            # Couldn't inline — surface a placeholder naming the message, and
+            # the resource pointer so the agent can fetch on demand.
+            blocks.append(
+                McplTextContent(type="text", text=f"[{kind}, message_id {message.id}]")
+            )
             blocks.append(
                 McplResourceContent(
                     type="resource",
