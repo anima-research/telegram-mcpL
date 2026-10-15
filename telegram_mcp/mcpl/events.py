@@ -7,7 +7,9 @@ MCPL `chat:*` tags for the host's addressing and wake filters, plus metadata:
   - botUserId, senderId, senderUsername
   - chatType, chatTitle
   - mentionIds, isMention
+  - messageId (also in the speaker header, where the agent can see it)
   - isReply, replyToMessageId, replyToAuthorId, replyToContent (snippet)
+  - isForward, forwardFrom, forwardDate
   - threadId for forum-topic supergroups
   - isPrivate, accountLabel
 
@@ -35,7 +37,16 @@ from telethon.tl.types import (
     User,
 )
 
-from .channels import channel_id_for, entity_to_descriptor
+from sanitize import sanitize_name
+
+from .access import chat_allowed
+from .channels import (
+    channel_id_for,
+    entity_to_descriptor,
+    is_registered,
+    note_registered,
+    note_unregistered,
+)
 from .content import message_to_content_blocks
 from .types import ChannelIncomingMessage
 
@@ -100,6 +111,49 @@ def _author_dict(sender: Any) -> dict[str, Any]:
     return {"id": str(getattr(sender, "id", "unknown")), "name": _resolve_name(sender)}
 
 
+def _forward_origin(message: Any) -> tuple[str, str | None] | None:
+    """(origin name, original date as "YYYY-MM-DD HH:MM UTC") for a forwarded
+    message, or None if it isn't one.
+
+    The origin is resolved the way the Telegram UI shows "Forwarded from":
+    the channel or group (`forward.chat`, with the post's signature if any),
+    else the user (`forward.sender`), both from entities Telethon already has;
+    else `fwd_from.from_name`, which is all there is when the original author
+    hides their account in forwards.
+    """
+    fwd = getattr(message, "fwd_from", None)
+    if fwd is None:
+        return None
+    name: str | None = None
+    forward = getattr(message, "forward", None)
+    if forward is not None:
+        chat = getattr(forward, "chat", None)
+        sender = getattr(forward, "sender", None)
+        if chat is not None:
+            name = _resolve_name(chat)
+            author = getattr(fwd, "post_author", None)
+            if author:
+                name = f"{name} ({author})"
+        elif sender is not None:
+            name = _resolve_name(sender)
+    if not name:
+        name = getattr(fwd, "from_name", None)
+    if not name and forward is not None:
+        peer_id = getattr(forward, "chat_id", None) or getattr(forward, "sender_id", None)
+        if peer_id is not None:
+            name = f"id:{peer_id}"
+    date = getattr(fwd, "date", None)
+    when = date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if date else None
+    return sanitize_name(name) or "unknown", when
+
+
+def _header_name(name: str) -> str:
+    """A name as it may appear in the header: its own [ ] become ( ), so a
+    display name or channel title can't add a fake "[message_id …]" or
+    "[forwarded from …]" field."""
+    return name.replace("[", "(").replace("]", ")")
+
+
 def _build_speaker_header(
     author_name: str,
     sender_username: str | None,
@@ -107,24 +161,43 @@ def _build_speaker_header(
 ) -> str:
     """Render the first-line speaker header that gets prepended to the
     agent's view of the message text. The agent's LLM sees this verbatim,
-    so the format needs to be chat-like and easy to attribute.
+    so the format needs to be chat-like and easy to attribute. Message ids
+    are in it because the host shows the agent content, not the event's
+    messageId, and the agent needs them for reply/edit/delete/pin.
 
     Examples:
-        "BobSmith (@bobby): "
-        "↳ in reply to OldBobby: \\"earlier message...\\"\\nBobSmith (@bobby): "
+        "BobSmith (@bobby) [message_id 311]: "
+        "↳ in reply to OldBobby [message_id 310]: \\"earlier message...\\"\\n"
+        "BobSmith (@bobby) [message_id 311]: "
+        "BobSmith [message_id 312] [forwarded from Some Channel, 2026-10-14 09:12 UTC]: "
     """
+    author_name = _header_name(author_name)
     name_part = f"{author_name} (@{sender_username})" if sender_username else author_name
+    if metadata.get("messageId"):
+        name_part += f" [message_id {metadata['messageId']}]"
+    if metadata.get("isForward"):
+        origin = _header_name(metadata.get("forwardFrom") or "unknown")
+        when = metadata.get("forwardDate")
+        name_part += (
+            f" [forwarded from {origin}, {when}]" if when else f" [forwarded from {origin}]"
+        )
 
     reply_lines: list[str] = []
     if metadata.get("isReply"):
-        reply_to_name = metadata.get("replyToAuthorName")
+        reply_id = metadata.get("replyToMessageId")
+        reply_name = metadata.get("replyToAuthorName")
+        target = " ".join(
+            filter(
+                None,
+                (reply_name and _header_name(reply_name), reply_id and f"[message_id {reply_id}]"),
+            )
+        )
+        line = f"↳ in reply to {target}" if target else "↳ in reply to"
         reply_to_content = metadata.get("replyToContent")
-        if reply_to_name and reply_to_content:
-            reply_lines.append(f'↳ in reply to {reply_to_name}: "{reply_to_content}"')
-        elif reply_to_name:
-            reply_lines.append(f"↳ in reply to {reply_to_name}")
-        elif reply_to_content:
-            reply_lines.append(f'↳ in reply to: "{reply_to_content}"')
+        if reply_to_content:
+            line += f': "{reply_to_content}"'
+        if target or reply_to_content:
+            reply_lines.append(line)
 
     if reply_lines:
         return "\n".join(reply_lines + [f"{name_part}: "])
@@ -193,6 +266,10 @@ async def build_incoming_message(
     descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
     if descriptor is None:
         return None
+    # TELEGRAM_ALLOWED_CHAT_IDS, checked against the entity so @username entries
+    # match too; before any media is downloaded.
+    if not chat_allowed(getattr(event, "chat_id", None), chat):
+        return None
 
     sender = await event.get_sender()
     author = _author_dict(sender)
@@ -219,6 +296,8 @@ async def build_incoming_message(
         "isReply": False,
         "isReplyToBot": False,
         "mentionIds": [str(uid) for uid in mention_ids],
+        "messageId": str(message.id),
+        "isForward": False,
     }
     if sender_id is not None:
         metadata["senderId"] = str(sender_id)
@@ -275,6 +354,13 @@ async def build_incoming_message(
                 replied_username = getattr(replied_sender, "username", None)
                 if replied_username:
                     metadata["replyToAuthorUsername"] = replied_username
+
+    origin = _forward_origin(message)
+    if origin is not None:
+        metadata["isForward"] = True
+        metadata["forwardFrom"], forward_date = origin
+        if forward_date:
+            metadata["forwardDate"] = forward_date
 
     # Forum topic id (supergroups only)
     thread_id: str | None = None
@@ -393,6 +479,9 @@ async def _build_chat_action_payload(
         return None
 
     chat = await event.get_chat()
+    # A chat outside TELEGRAM_ALLOWED_CHAT_IDS isn't disclosed to the host, joined or left.
+    if not chat_allowed(getattr(event, "chat_id", None), chat):
+        return None
     if user_left or user_kicked:
         descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
         if descriptor is None:
@@ -404,6 +493,25 @@ async def _build_chat_action_payload(
             return None
         return {"added": [descriptor]}
     return None
+
+
+async def register_if_new(
+    transport: McplTransport,
+    chat: Any,
+    *,
+    account_label: str,
+    self_id: int,
+) -> None:
+    """Announce a chat the host hasn't been told about (channels/changed added).
+
+    Called before pushing an incoming message: a chat missing from the startup
+    registration would otherwise be dropped by hosts that require registration.
+    """
+    descriptor = entity_to_descriptor(chat, account_label=account_label, self_id=self_id)
+    if descriptor is None or is_registered(descriptor["id"]):
+        return
+    await transport.send_notification("channels/changed", {"added": [descriptor]})
+    note_registered([descriptor["id"]])
 
 
 async def attach_event_handlers(
@@ -466,6 +574,19 @@ async def attach_event_handlers(
                     policy.fs_enabled,
                 )
                 return
+            if (policy is None or policy.can_register) and not is_registered(payload["channelId"]):
+                # Best effort: a failed registration must not cost the message itself.
+                try:
+                    await register_if_new(
+                        transport,
+                        await event.get_chat(),
+                        account_label=account_label,
+                        self_id=self_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.warning(
+                        "could not register %s before its first message", payload["channelId"]
+                    )
             await transport.send_notification("channels/incoming", {"messages": [payload]})
         except Exception:
             log.exception("Failed to push NewMessage event")
@@ -482,6 +603,8 @@ async def attach_event_handlers(
                 log.info("channels/changed suppressed — channels.register not granted")
                 return
             await transport.send_notification("channels/changed", payload)
+            note_registered(d["id"] for d in payload.get("added", []))
+            note_unregistered(payload.get("removed", []))
         except Exception:
             log.exception("Failed to push ChatAction event")
 

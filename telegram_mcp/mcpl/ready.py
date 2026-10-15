@@ -20,7 +20,9 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from . import push
 from .policy import PolicyState, host_speaks_0_5
+from .channels import note_registered
 from .transport import McplTransport
 
 log = logging.getLogger("telegram_mcp.mcpl")
@@ -53,6 +55,7 @@ def make_on_ready(
     """
 
     async def on_ready(transport: McplTransport) -> None:
+        push.bind(transport, policy)  # every push still checks the live grant
         if host_speaks_0_5(transport.host_capabilities):
             answered = await policy.wait_ready(policy_wait_seconds)
             if not answered:
@@ -83,6 +86,7 @@ def make_on_ready(
             except Exception as exc:  # noqa: BLE001 — never block the agent on enumeration
                 log.error("Failed to enumerate channels for account '%s': %s", label, exc)
         await transport.send_notification("channels/register", {"channels": all_channels})
+        note_registered(c["id"] for c in all_channels)
         log.info("Registered %d MCPL channels with host", len(all_channels))
 
         await _attach_all(clients, transport, policy, attach_event_handlers)
