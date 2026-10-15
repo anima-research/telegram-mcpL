@@ -119,9 +119,10 @@ def make_publish_handler(
             peer: Any = "me"
         else:
             assert peer_id is not None  # parse_channel_id guarantees this
-            if not chat_allowed(peer_id):
-                raise ValueError(f"{channel_id} is not in TELEGRAM_ALLOWED_CHAT_IDS")
             peer = await resolve_entity_fn(peer_id, client)
+            # Checked against the entity, so @username entries match too.
+            if not chat_allowed(peer_id, peer):
+                raise ValueError(f"{channel_id} is not in TELEGRAM_ALLOWED_CHAT_IDS")
 
         text = extract_text(content)
         if not text:
@@ -271,8 +272,6 @@ def make_typing_handler(
         client = clients.get(account_label)
         if client is None:
             return
-        if kind != "saved" and not chat_allowed(peer_id):
-            return
 
         # Arm the deadline first so an already-running loop picks it up.
         deadlines[channel_id] = asyncio.get_running_loop().time() + refresh_window
@@ -281,8 +280,8 @@ def make_typing_handler(
 
         await ensure_connected_fn(client)
         peer: Any = "me" if kind == "saved" else await resolve_entity_fn(peer_id, client)
-        if peer is None:
-            deadlines.pop(channel_id, None)  # entity didn't resolve — undo the arm
+        if peer is None or (kind != "saved" and not chat_allowed(peer_id, peer)):
+            deadlines.pop(channel_id, None)  # unresolved or not allowed — undo the arm
             return
         tasks[channel_id] = asyncio.create_task(_keep_typing(channel_id, client, peer))
 

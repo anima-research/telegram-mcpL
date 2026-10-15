@@ -184,6 +184,33 @@ async def _sign_in_with_bot_token(label, client) -> bool:
     return True
 
 
+async def _verify_bot_identity(label, client) -> None:
+    """With a bot token configured, the session must be that bot.
+
+    An existing session file (TELEGRAM_SESSION_NAME) that belongs to a user or
+    another bot is authorized already, so the token would never be used and the
+    server would act as that other account. A bot token starts with the bot's
+    numeric id. The token itself is never logged.
+    """
+    from telegram_mcp.mcpl.access import bot_token_for
+
+    token = bot_token_for(label)
+    if not token:
+        return
+    me = await client.get_me()
+    expected = token.split(":", 1)[0]
+    if getattr(me, "bot", False) and str(getattr(me, "id", "")) == expected:
+        return
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"Telegram client '{label}': the session belongs to a different account than the "
+        "configured bot token. Remove the session (TELEGRAM_SESSION_NAME file) or fix the token."
+    )
+
+
 async def _connect_authorized_client(label, client) -> None:
     # First, prevent our own duplicate-spawn case outright: a per-session lock
     # means a second instance of this server never even attempts to connect
@@ -227,10 +254,12 @@ async def _connect_authorized_client(label, client) -> None:
             await asyncio.sleep(delay)
 
     if await client.is_user_authorized():
+        await _verify_bot_identity(label, client)
         await _verify_expected_username(label, client)
         return
 
     if await _sign_in_with_bot_token(label, client):
+        await _verify_bot_identity(label, client)
         await _verify_expected_username(label, client)
         return
 

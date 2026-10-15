@@ -103,6 +103,30 @@ def _label_for(entity: Any, kind: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Channel ids the host has been told about (channels/register at startup,
+# channels/changed since). A chat that couldn't be enumerated at startup (a
+# bot's cold supergroup, a user account's brand-new DM) is registered on its
+# first incoming message instead of being dropped by the host as unknown.
+_registered_ids: set[str] = set()
+
+
+def note_registered(ids) -> None:
+    _registered_ids.update(ids)
+
+
+def note_unregistered(ids) -> None:
+    _registered_ids.difference_update(ids)
+
+
+def is_registered(channel_id: str) -> bool:
+    return channel_id in _registered_ids
+
+
+def reset_registered() -> None:
+    """Test helper."""
+    _registered_ids.clear()
+
+
 def channel_id_for(account_label: str, kind: str, peer_id: int | str) -> str:
     """Build the canonical MCPL channel id for a Telegram entity.
 
