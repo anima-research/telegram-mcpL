@@ -108,7 +108,7 @@ def client(monkeypatch):
 async def test_send_message_attaches_chip_entity(client):
     text = "TODO 13/09 17:00"
     result = await messages.send_message(42, text, format_date="13/09 17:00", account="test")
-    assert "successfully" in result
+    assert result.startswith("Message sent (")
     req = client.await_args.args[0]
     assert isinstance(req, functions.messages.SendMessageRequest)
     assert req.message == text
@@ -129,7 +129,7 @@ async def test_reply_to_message_attaches_chip_entity(client):
     result = await messages.reply_to_message(
         42, 7, "At 13/09 17:00 ok", format_date="13/09 17:00", account="test"
     )
-    assert "Replied" in result
+    assert result.startswith("Reply to message ")
     req = client.await_args.args[0]
     assert isinstance(req, functions.messages.SendMessageRequest)
     assert isinstance(req.reply_to, types.InputReplyToMessage)

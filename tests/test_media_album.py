@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,10 @@ class _DummyClient:
             "reply_to": reply_to,
         }
         self.schedule = schedule
+        # Telethon returns the sent Message, or a list of them for an album.
+        if isinstance(file_paths, list):
+            return [SimpleNamespace(id=501 + i) for i in range(len(file_paths))]
+        return SimpleNamespace(id=501)
 
 
 @pytest.mark.asyncio
@@ -52,7 +57,7 @@ async def test_album_mode_sends_multiple_files_as_one_media_group(
         caption="pick one",
     )
 
-    assert result == "Album sent to chat AgenticAIChat with 2 files."
+    assert result == "Album of 2 files sent (message_ids 501, 502, chat_id AgenticAIChat)."
     assert client.sent == {
         "entity": "entity:AgenticAIChat",
         "file_paths": [str(first), str(second)],
@@ -89,7 +94,7 @@ async def test_album_mode_passes_topic_id_as_reply_to(tmp_path, monkeypatch, too
         topic_id=777,
     )
 
-    assert result == "Album sent to chat ForumChat with 2 files."
+    assert result == "Album of 2 files sent (message_ids 501, 502, chat_id ForumChat)."
     assert client.sent["reply_to"] == 777
 
 
@@ -112,7 +117,7 @@ async def test_send_file_passes_topic_id_as_reply_to(tmp_path, monkeypatch):
 
     result = await media.send_file("ForumChat", "doc.pdf", caption="hello", topic_id=42)
 
-    assert result == f"File sent to chat ForumChat from {path}."
+    assert result == f"File sent from {path} (message_id 501, chat_id ForumChat)."
     assert client.sent == {
         "entity": "entity:forum",
         "file_paths": str(path),
@@ -178,7 +183,10 @@ async def test_send_file_schedules_when_schedule_date_given(tmp_path, monkeypatc
         "Channel", "poster.png", caption="later", schedule_date=when.isoformat()
     )
 
-    assert result == f"File from {path} scheduled for {when.isoformat()} in chat Channel."
+    assert result == (
+        f"File from {path} scheduled for {when.isoformat()} "
+        "(scheduled message_id 501, chat_id Channel)."
+    )
     assert client.schedule == when
 
 

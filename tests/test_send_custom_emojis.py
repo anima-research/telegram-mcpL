@@ -209,8 +209,11 @@ async def _edit(text, **kw):
 
 
 TOOLS = {
-    "send_message": (_send, "Message sent successfully."),
-    "reply_to_message": (_reply, "Replied to message 7 in chat 42."),
+    "send_message": (_send, "Message sent (message_id not returned by Telegram, chat_id 42)."),
+    "reply_to_message": (
+        _reply,
+        "Reply to message 7 sent (message_id not returned by Telegram, chat_id 42).",
+    ),
     "edit_message": (_edit, "Message 7 edited."),
 }
 

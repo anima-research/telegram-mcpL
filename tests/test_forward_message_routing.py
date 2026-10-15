@@ -69,7 +69,10 @@ def client(monkeypatch):
 @pytest.mark.asyncio
 async def test_legacy_call_is_unchanged(client):
     result = await messages.forward_message("source", 10, "destination", expand_album=False)
-    assert result == "Message 10 forwarded from source to destination."
+    assert result == (
+        "Message 10 forwarded from source to destination. "
+        "Destination message IDs: not returned by Telegram (chat_id 22)."
+    )
     assert client.legacy == [((client.peers["destination"], 10, client.peers["source"]), {})]
     assert client.requests == []
 
@@ -98,7 +101,7 @@ async def test_routed_forward_uses_native_request(client, route):
     result = await messages.forward_message("source", [10, 12], "destination", **route)
     assert result == (
         "2 messages forwarded from source to destination. "
-        "Destination message IDs: not returned by Telegram."
+        "Destination message IDs: not returned by Telegram (chat_id 22)."
     )
     assert client.legacy == []
     assert client.reads == []
@@ -280,7 +283,8 @@ async def test_native_forward_reports_request_correlated_destination_ids(client)
     client.build_updates = updates
     result = await messages.forward_message("source", [10, 12], "destination", topic_id=7)
     assert result == (
-        "2 messages forwarded from source to destination. Destination message IDs: [700, 701]."
+        "2 messages forwarded from source to destination. "
+        "Destination message IDs: [700, 701] (chat_id 22)."
     )
     assert client.legacy == []
 
@@ -292,7 +296,7 @@ async def test_native_forward_reports_only_ids_telegram_returned(client):
 
     client.build_updates = updates
     result = await messages.forward_message("source", [10, 12], "destination", silent=True)
-    assert result.endswith("Destination message IDs: [701].")
+    assert result.endswith("Destination message IDs: [701] (chat_id 22).")
 
 
 @pytest.mark.asyncio
@@ -304,5 +308,5 @@ async def test_native_forward_states_when_no_ids_were_returned(client):
     result = await messages.forward_message("source", 10, "destination", drop_author=True)
     assert result == (
         "Message 10 forwarded from source to destination. "
-        "Destination message IDs: not returned by Telegram."
+        "Destination message IDs: not returned by Telegram (chat_id 22)."
     )

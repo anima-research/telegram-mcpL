@@ -3,6 +3,8 @@
 from telegram_mcp.runtime import *
 from typing import Optional
 
+from telegram_mcp.sent import chat_id_of, sent_ids, sent_note
+
 
 @mcp.tool(
     annotations=ToolAnnotations(title="List Contacts", openWorldHint=True, readOnlyHint=True)
@@ -592,20 +594,20 @@ async def send_contact(
         from telethon.tl.types import InputMediaContact
         import random
 
-        await cl(
-            functions.messages.SendMediaRequest(
-                peer=entity,
-                media=InputMediaContact(
-                    phone_number=phone_number,
-                    first_name=first_name,
-                    last_name=last_name,
-                    vcard=vcard,
-                ),
-                message="",
-                random_id=random.randint(0, 2**63 - 1),
-            )
+        request = functions.messages.SendMediaRequest(
+            peer=entity,
+            media=InputMediaContact(
+                phone_number=phone_number,
+                first_name=first_name,
+                last_name=last_name,
+                vcard=vcard,
+            ),
+            message="",
+            random_id=random.randint(0, 2**63 - 1),
         )
-        return f"Contact sent to chat {chat_id}."
+        result = await cl(request)
+        note = sent_note(sent_ids(result, request.random_id), chat_id_of(entity, chat_id))
+        return f"Contact sent ({note})."
     except Exception as e:
         return log_and_format_error("send_contact", e, chat_id=chat_id, phone_number=phone_number)
 

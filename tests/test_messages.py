@@ -51,7 +51,7 @@ async def test_create_poll_int_chat_id(mock_telethon):
         options=["Python", "Rust", "Go"],
     )
 
-    assert "Poll created successfully in chat 12345678." in res
+    assert res == "Poll created (message_id not returned by Telegram, chat_id 12345678)."
     assert len(mock_telethon["sent_requests"]) == 1
 
     req = mock_telethon["sent_requests"][0]
@@ -78,7 +78,7 @@ async def test_create_poll_string_int_chat_id(mock_telethon):
         options=["Yes", "No"],
     )
 
-    assert "Poll created successfully" in res
+    assert res.startswith("Poll created (")
     assert len(mock_telethon["sent_requests"]) == 1
     req = mock_telethon["sent_requests"][0]
     assert req.media.poll.question.text == "Ready for the release?"
@@ -92,7 +92,7 @@ async def test_create_poll_username_chat_id(mock_telethon):
         options=["Definitely", "Maybe", "No"],
     )
 
-    assert "Poll created successfully" in res
+    assert res.startswith("Poll created (")
     assert "@my_channel" in res
     assert len(mock_telethon["sent_requests"]) == 1
 
@@ -107,7 +107,7 @@ async def test_create_poll_options_dict_list_reproduces_issue_179(mock_telethon)
         options=[{"option": "Water"}, {"option": "Milk"}, {"option": "Cola"}],
     )
 
-    assert "Poll created successfully" in res
+    assert res.startswith("Poll created (")
     assert len(mock_telethon["sent_requests"]) == 1
     poll = mock_telethon["sent_requests"][0].media.poll
     assert [a.text.text for a in poll.answers] == ["Water", "Milk", "Cola"]
@@ -124,7 +124,7 @@ async def test_create_poll_options_text_key_dict_list(mock_telethon):
         options=[{"text": "First"}, {"text": "Second"}],
     )
 
-    assert "Poll created successfully" in res
+    assert res.startswith("Poll created (")
     poll = mock_telethon["sent_requests"][0].media.poll
     assert [a.text.text for a in poll.answers] == ["First", "Second"]
 
@@ -137,7 +137,7 @@ async def test_create_poll_options_json_string(mock_telethon):
         options='["Option A", "Option B", "Option C"]',
     )
 
-    assert "Poll created successfully" in res
+    assert res.startswith("Poll created (")
     poll = mock_telethon["sent_requests"][0].media.poll
     assert [a.text.text for a in poll.answers] == ["Option A", "Option B", "Option C"]
 
@@ -150,7 +150,7 @@ async def test_create_poll_options_comma_separated_string(mock_telethon):
         options="Cat, Dog, Bird",
     )
 
-    assert "Poll created successfully" in res
+    assert res.startswith("Poll created (")
     poll = mock_telethon["sent_requests"][0].media.poll
     assert [a.text.text for a in poll.answers] == ["Cat", "Dog", "Bird"]
 
@@ -167,7 +167,7 @@ async def test_create_poll_attributes(mock_telethon):
         close_date="2026-12-31 23:59:59",
     )
 
-    assert "Poll created successfully" in res
+    assert res.startswith("Poll created (")
     poll = mock_telethon["sent_requests"][0].media.poll
     assert poll.multiple_choice is True
     assert poll.quiz is True

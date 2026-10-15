@@ -159,6 +159,27 @@ copy-date / add-to-calendar / reminder actions. Plain-text messages only —
 omit `parse_mode`. For example, `send_message(chat_id, "Lunch 13/09 13:00",
 format_date="13/09 13:00")` sends a message whose date opens that menu.
 
+### Message ids
+
+Send tools end their result with the new message's id and the chat it went to,
+so the agent can edit, delete, pin or reply to it later:
+`Message sent (message_id 312, chat_id 74631161).`, an album lists every id
+(`message_ids 330, 331, 332`), and a rich send's JSON carries `message_id` and
+`chat_id`. Covered: `send_message`, `reply_to_message`, `send_file`,
+`send_album`, `send_voice`, `send_sticker`, `send_gif`, `send_contact`,
+`create_poll`, `forward_message(s)`.
+
+In MCPL mode every incoming message's text starts with its id, and with forward
+and reply context when there is some:
+
+```
+↳ in reply to Glassy [message_id 310]: "earlier text"
+Misha (@magnumlink) [message_id 311] [forwarded from Some Channel, 2026-10-14 09:12 UTC]: text
+```
+
+The same facts are in the event metadata (`messageId`, `replyToMessageId`,
+`isForward`, `forwardFrom`, `forwardDate`).
+
 ### Incoming Event Feed (callback mode, Claude Code only)
 
 By default, an agent waits for replies by calling `wait_for_settled_message`, which blocks up to the MCP tool timeout and must be re-called — that works everywhere (Codex, Cursor, etc.) and is unchanged.

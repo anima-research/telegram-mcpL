@@ -2,6 +2,7 @@
 
 from telegram_mcp.runtime import *
 from telegram_mcp import transcription
+from telegram_mcp.sent import chat_id_of, sent_ids, sent_note
 from pydantic import StrictInt
 
 # Domain used to build message permalinks. Overridable because the default is a
@@ -463,24 +464,30 @@ async def _send_rich(cl, entity, text: str, parse_mode: str, reply_to: Optional[
 
     if not await account_is_premium(cl):
         return premium_required_result("send_message")
+    request = functions.messages.SendMessageRequest(
+        peer=entity,
+        message=text,
+        random_id=random.randint(0, 2**62),
+        reply_to=(types.InputReplyToMessage(reply_to_msg_id=reply_to) if reply_to else None),
+        rich_message=make_rich_input(parse_mode, text),
+    )
     try:
-        await cl(
-            functions.messages.SendMessageRequest(
-                peer=entity,
-                message=text,
-                random_id=random.randint(0, 2**62),
-                reply_to=(
-                    types.InputReplyToMessage(reply_to_msg_id=reply_to) if reply_to else None
-                ),
-                rich_message=make_rich_input(parse_mode, text),
-            )
-        )
+        result = await cl(request)
     except telethon.errors.RPCError as e:
         # Premium can lapse between the check above and the send — same refusal.
         if is_premium_rpc_error(e):
             return premium_required_result("send_message")
         raise
-    return json.dumps({"sent": True, "rich": True}, ensure_ascii=False)
+    out = {"sent": True, "rich": True}
+    ids = sent_ids(result, request.random_id)
+    if len(ids) == 1:
+        out["message_id"] = ids[0]
+    elif ids:
+        out["message_ids"] = ids
+    chat = chat_id_of(entity)
+    if chat is not None:
+        out["chat_id"] = chat
+    return json.dumps(out, ensure_ascii=False)
 
 
 async def _edit_rich(cl, entity, message_id: int, text: str, parse_mode: str):
@@ -793,17 +800,17 @@ async def send_message(
                 return error
             import random
 
-            await cl(
-                functions.messages.SendMessageRequest(
-                    peer=entity,
-                    message=message,
-                    random_id=random.randint(0, 2**62),
-                    entities=entities,
-                )
+            request = functions.messages.SendMessageRequest(
+                peer=entity,
+                message=message,
+                random_id=random.randint(0, 2**62),
+                entities=entities,
             )
-            return "Message sent successfully."
-        await cl.send_message(entity, message, parse_mode=parse_mode)
-        return "Message sent successfully."
+            result = await cl(request)
+            ids = sent_ids(result, request.random_id)
+        else:
+            ids = sent_ids(await cl.send_message(entity, message, parse_mode=parse_mode))
+        return f"Message sent ({sent_note(ids, chat_id_of(entity, chat_id))})."
     except Exception as e:
         return log_and_format_error("send_message", e, chat_id=chat_id)
 
@@ -1713,10 +1720,13 @@ async def forward_message(
                 if random_id in returned_ids
             ]
             destination_note = (
-                f" Destination message IDs: {destination_ids or 'not returned by Telegram'}."
+                f" Destination message IDs: {destination_ids or 'not returned by Telegram'}"
             )
         else:
-            await cl.forward_messages(to_entity, ids_to_forward, from_entity)
+            forwarded = await cl.forward_messages(to_entity, ids_to_forward, from_entity)
+            destination_note = (
+                f" Destination message IDs: {sent_ids(forwarded) or 'not returned by Telegram'}"
+            )
         count = len(ids_to_forward) if isinstance(ids_to_forward, list) else 1
         if count == 1:
             summary = f"Message {message_id} forwarded from {from_chat_id} to {to_chat_id}."
@@ -1727,7 +1737,7 @@ async def forward_message(
             )
         else:
             summary = f"{count} messages forwarded from {from_chat_id} to {to_chat_id}."
-        return summary + destination_note
+        return f"{summary}{destination_note} (chat_id {chat_id_of(to_entity, to_chat_id)})."
     except Exception as e:
         return log_and_format_error(
             "forward_message",
@@ -1778,8 +1788,11 @@ async def forward_messages(
         cl = get_client(account)
         from_entity = await resolve_entity(from_chat_id, cl)
         to_entity = await resolve_entity(to_chat_id, cl)
-        await cl.forward_messages(to_entity, list(message_ids), from_entity)
-        return f"{len(message_ids)} messages forwarded from " f"{from_chat_id} to {to_chat_id}."
+        forwarded = await cl.forward_messages(to_entity, list(message_ids), from_entity)
+        return (
+            f"{len(message_ids)} messages forwarded from {from_chat_id} to {to_chat_id} "
+            f"({sent_note(sent_ids(forwarded), chat_id_of(to_entity, to_chat_id))})."
+        )
     except Exception as e:
         return log_and_format_error(
             "forward_messages",
@@ -2142,18 +2155,22 @@ async def reply_to_message(
                 return error
             import random
 
-            await cl(
-                functions.messages.SendMessageRequest(
-                    peer=entity,
-                    message=text,
-                    random_id=random.randint(0, 2**62),
-                    reply_to=types.InputReplyToMessage(reply_to_msg_id=message_id),
-                    entities=entities,
-                )
+            request = functions.messages.SendMessageRequest(
+                peer=entity,
+                message=text,
+                random_id=random.randint(0, 2**62),
+                reply_to=types.InputReplyToMessage(reply_to_msg_id=message_id),
+                entities=entities,
             )
-            return f"Replied to message {message_id} in chat {chat_id}."
-        await cl.send_message(entity, text, reply_to=message_id, parse_mode=parse_mode)
-        return f"Replied to message {message_id} in chat {chat_id}."
+            result = await cl(request)
+            ids = sent_ids(result, request.random_id)
+        else:
+            ids = sent_ids(
+                await cl.send_message(entity, text, reply_to=message_id, parse_mode=parse_mode)
+            )
+        return (
+            f"Reply to message {message_id} sent ({sent_note(ids, chat_id_of(entity, chat_id))})."
+        )
     except Exception as e:
         return log_and_format_error(
             "reply_to_message", e, chat_id=chat_id, message_id=message_id, text=text
@@ -2475,16 +2492,15 @@ async def create_poll(
             close_date=close_date_obj,
         )
 
-        result = await cl(
-            functions.messages.SendMediaRequest(
-                peer=entity,
-                media=InputMediaPoll(poll=poll),
-                message="",
-                random_id=random.randint(0, 2**63 - 1),
-            )
+        request = functions.messages.SendMediaRequest(
+            peer=entity,
+            media=InputMediaPoll(poll=poll),
+            message="",
+            random_id=random.randint(0, 2**63 - 1),
         )
-
-        return f"Poll created successfully in chat {chat_id}."
+        result = await cl(request)
+        note = sent_note(sent_ids(result, request.random_id), chat_id_of(entity, chat_id))
+        return f"Poll created ({note})."
     except Exception as e:
         return log_and_format_error(
             "create_poll", e, chat_id=chat_id, question=question, options=options

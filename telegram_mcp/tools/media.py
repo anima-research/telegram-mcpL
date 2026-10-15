@@ -10,6 +10,7 @@ from pypdf import PdfReader
 
 from telegram_mcp.runtime import *
 
+from telegram_mcp.sent import chat_id_of, sent_ids, sent_note
 from telegram_mcp.contact_sheet import ContactSheetUnavailable, build_contact_sheet
 from telegram_mcp.photo_source import (
     AVATAR_SOURCE,
@@ -90,10 +91,13 @@ async def send_file(
         if path_error:
             return path_error
         entity = await resolve_entity(chat_id, cl)
-        await cl.send_file(entity, str(safe_path), caption=caption, reply_to=topic_id, schedule=dt)
+        sent = await cl.send_file(
+            entity, str(safe_path), caption=caption, reply_to=topic_id, schedule=dt
+        )
+        note = sent_note(sent_ids(sent), chat_id_of(entity, chat_id))
         if dt:
-            return f"File from {safe_path} scheduled for {dt.isoformat()} in chat {chat_id}."
-        return f"File sent to chat {chat_id} from {safe_path}."
+            return f"File from {safe_path} scheduled for {dt.isoformat()} (scheduled {note})."
+        return f"File sent from {safe_path} ({note})."
     except Exception as e:
         return log_and_format_error(
             "send_file",
@@ -137,12 +141,13 @@ async def _send_album(
         safe_paths.append(str(safe_path))
 
     entity = await resolve_entity(chat_id, cl)
-    await cl.send_file(entity, safe_paths, caption=caption, reply_to=topic_id, schedule=dt)
+    sent = await cl.send_file(entity, safe_paths, caption=caption, reply_to=topic_id, schedule=dt)
+    note = sent_note(sent_ids(sent), chat_id_of(entity, chat_id))
     if dt:
         return (
-            f"Album of {len(safe_paths)} files scheduled for {dt.isoformat()} in chat {chat_id}."
+            f"Album of {len(safe_paths)} files scheduled for {dt.isoformat()} (scheduled {note})."
         )
-    return f"Album sent to chat {chat_id} with {len(safe_paths)} files."
+    return f"Album of {len(safe_paths)} files sent ({note})."
 
 
 @mcp.tool(
@@ -335,8 +340,9 @@ async def send_voice(
             return "Voice file must be .ogg or .opus format."
 
         entity = await resolve_entity(chat_id, cl)
-        await cl.send_file(entity, str(safe_path), voice_note=True, reply_to=topic_id)
-        return f"Voice message sent to chat {chat_id} from {safe_path}."
+        sent = await cl.send_file(entity, str(safe_path), voice_note=True, reply_to=topic_id)
+        note = sent_note(sent_ids(sent), chat_id_of(entity, chat_id))
+        return f"Voice message sent from {safe_path} ({note})."
     except Exception as e:
         return log_and_format_error(
             "send_voice", e, chat_id=chat_id, file_path=file_path, topic_id=topic_id
@@ -458,8 +464,9 @@ async def send_sticker(
             return path_error
 
         entity = await resolve_entity(chat_id, cl)
-        await cl.send_file(entity, str(safe_path), force_document=False, reply_to=topic_id)
-        return f"Sticker sent to chat {chat_id} from {safe_path}."
+        sent = await cl.send_file(entity, str(safe_path), force_document=False, reply_to=topic_id)
+        note = sent_note(sent_ids(sent), chat_id_of(entity, chat_id))
+        return f"Sticker sent from {safe_path} ({note})."
     except Exception as e:
         return log_and_format_error(
             "send_sticker", e, chat_id=chat_id, file_path=file_path, topic_id=topic_id
@@ -548,8 +555,8 @@ async def send_gif(
         if not isinstance(gif_id, int):
             return "gif_id must be a Telegram document ID (integer), not a file path. Use get_gif_search to find IDs."
         entity = await resolve_entity(chat_id, cl)
-        await cl.send_file(entity, gif_id, reply_to=topic_id)
-        return f"GIF sent to chat {chat_id}."
+        sent = await cl.send_file(entity, gif_id, reply_to=topic_id)
+        return f"GIF sent ({sent_note(sent_ids(sent), chat_id_of(entity, chat_id))})."
     except Exception as e:
         return log_and_format_error(
             "send_gif", e, chat_id=chat_id, gif_id=gif_id, topic_id=topic_id
