@@ -61,10 +61,12 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "delete_messages_bulk": _COMMS,
     "delete_chat_history": _COMMS,
     "forward_message": _COMMS,
+    "forward_messages": _COMMS,
     "pin_message": _COMMS,
     "unpin_message": _COMMS,
     "unpin_all_messages": _COMMS,
     "create_poll": _COMMS,
+    "vote_poll": _COMMS,
     "send_reaction": _COMMS,
     "remove_reaction": _COMMS,
     "send_gif": _COMMS,
@@ -89,6 +91,14 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "get_media_info": _COMMS,
     "get_last_interaction": _COMMS,
     "get_recent_actions": _COMMS,
+    "get_send_as": _COMMS,
+    "inspect_document": _COMMS,
+    "transcribe_voice": _COMMS,
+    "list_photos": _COMMS,
+    "get_photo_sheet": _COMMS,
+    # Block until people message the account, then return those chats.
+    "wait_for_new_message": _COMMS,
+    "wait_for_settled_message": _COMMS,
     # --- comms: chats, people, and lookups used to message them --------------
     "get_chats": _COMMS,
     "list_chats": _COMMS,
@@ -101,6 +111,8 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "get_message_link": _COMMS,
     "get_gif_search": _COMMS,
     "get_sticker_sets": _COMMS,
+    "get_custom_emoji_packs": _COMMS,
+    "get_custom_emoji_pack": _COMMS,
     "list_contacts": _COMMS,
     "search_contacts": _COMMS,
     "get_contact_ids": _COMMS,
@@ -110,6 +122,7 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "get_blocked_users": _COMMS,
     "get_participants": _COMMS,
     "get_admins": _COMMS,
+    "get_member_admin_status": _COMMS,
     "get_banned_users": _COMMS,
     "get_full_user": _COMMS,
     "get_user_photos": _COMMS,
@@ -121,6 +134,10 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "send_sticker": _COMMS_FILES,
     "upload_file": _COMMS_FILES,
     "download_media": _COMMS_FILES,
+    "send_album": _COMMS_FILES,
+    "open_photo": _COMMS_FILES,
+    "preview_custom_emoji": _COMMS_FILES,
+    "export_unread_messages": _COMMS_FILES,
     # --- comms + control: membership, moderation and contact management ------
     "create_group": _COMMS_CONTROL,
     "create_channel": _COMMS_CONTROL,
@@ -138,9 +155,14 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "demote_admin": _COMMS_CONTROL,
     "edit_admin_rights": _COMMS_CONTROL,
     "ban_user": _COMMS_CONTROL,
+    "remove_user": _COMMS_CONTROL,
     "unban_user": _COMMS_CONTROL,
     "set_default_chat_permissions": _COMMS_CONTROL,
     "toggle_slow_mode": _COMMS_CONTROL,
+    "enable_forum_topics": _COMMS_CONTROL,
+    "create_forum_topic": _COMMS_CONTROL,
+    "edit_forum_topic": _COMMS_CONTROL,
+    "delete_forum_topic": _COMMS_CONTROL,
     "add_contact": _COMMS_CONTROL,
     "delete_contact": _COMMS_CONTROL,
     "import_contacts": _COMMS_CONTROL,
@@ -148,11 +170,16 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "unblock_user": _COMMS_CONTROL,
     # --- comms + control + files ---------------------------------------------
     "edit_chat_photo": ("comms", "control", "files"),
+    # Background task that appends people's incoming messages to a feed file.
+    "enable_incoming_feed": ("comms", "control", "files"),
     # --- comms + control: account settings that carry other people ----------
     # Folder listings return chat titles (in private chats, a person's name);
     # privacy rules read and write lists of specific users to allow or block.
+    # Folder snapshots and patches carry the same included/excluded/pinned peers.
     "list_folders": _COMMS_CONTROL,
     "get_folder": _COMMS_CONTROL,
+    "get_folder_snapshot": _COMMS_CONTROL,
+    "update_folder": _COMMS_CONTROL,
     "get_privacy_settings": _COMMS_CONTROL,
     "set_privacy_settings": _COMMS_CONTROL,
     # --- control: the account's own settings, folders and chat state ---------
@@ -165,9 +192,17 @@ TOOL_CLASSES: dict[str, tuple[str, ...]] = {
     "remove_chat_from_folder": _CONTROL,
     "delete_folder": _CONTROL,
     "reorder_folders": _CONTROL,
+    "get_folder_limits": _CONTROL,
     "list_accounts": _CONTROL,
     "get_me": _CONTROL,
     "set_bot_commands": _CONTROL,
+    "disable_incoming_feed": _CONTROL,
+    "incoming_feed_status": _CONTROL,
+    # --- comms + memory: the account's remembered names for people -----------
+    # A local store mapping what the user calls someone to that person's chat.
+    "set_contact_alias": ("comms", "memory"),
+    "list_contact_aliases": ("comms", "memory"),
+    "delete_contact_alias": ("comms", "memory"),
     # --- body: the account's own profile -------------------------------------
     # A public bio is speech that reaches people, so update_profile is also comms.
     "update_profile": ("body", "comms"),

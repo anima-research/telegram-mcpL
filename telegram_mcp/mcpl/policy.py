@@ -48,6 +48,16 @@ FS_USES: tuple[str, ...] = (
     CAP_TYPING,
 )
 
+# A separate set, so a host that denies push events (or an operator who
+# disables this set) loses only the transcript wake, never messaging.
+FS_TRANSCRIPTS_NAME = "telegram.transcripts"
+FS_TRANSCRIPTS_DESCRIPTION = (
+    "A transcribe_voice call that outlives its wait answers \"running\"; the "
+    "finished transcript (or the failure) arrives later as a push/event."
+)
+CAP_PUSH = "pushEvents"
+FS_TRANSCRIPTS_USES: tuple[str, ...] = (CAP_PUSH,)
+
 
 def host_speaks_0_5(host_capabilities: dict[str, Any] | None) -> bool:
     """True when the host advertised MCPL >= 0.5 in `initialize`.
@@ -74,6 +84,7 @@ class PolicyState:
         self.policy_received: bool = False
         self.effective_capabilities: set[str] = set()
         self.fs_enabled: bool = False
+        self.transcripts_enabled: bool = False
         self._ready = asyncio.Event()
 
     # -- authorization questions -------------------------------------------
@@ -89,6 +100,10 @@ class PolicyState:
     @property
     def can_push_incoming(self) -> bool:
         return self.fs_enabled and self.granted(CAP_INCOMING)
+
+    @property
+    def can_push_transcripts(self) -> bool:
+        return self.transcripts_enabled and self.granted(CAP_PUSH)
 
     async def wait_ready(self, timeout: float) -> bool:
         """Block until the initial policy Request has been answered.
@@ -159,6 +174,11 @@ class PolicyState:
         explicitly_disabled = FS_NAME in disabled_list
         selected = (not isinstance(enabled_list, list)) or (FS_NAME in enabled_list)
         self.fs_enabled = (not missing) and not explicitly_disabled and selected
+        self.transcripts_enabled = (
+            all(c in effective_set for c in FS_TRANSCRIPTS_USES)
+            and FS_TRANSCRIPTS_NAME not in disabled_list
+            and ((not isinstance(enabled_list, list)) or (FS_TRANSCRIPTS_NAME in enabled_list))
+        )
 
         receipt: dict[str, Any] = {"accepted": True, "unavailableFeatures": [], "notes": []}
         if not self.fs_enabled:
@@ -183,10 +203,12 @@ class PolicyState:
             )
 
         log.info(
-            "featureSets/update Request applied: %d capabilities, %s %s",
+            "featureSets/update Request applied: %d capabilities, %s %s, %s %s",
             len(effective_set),
             FS_NAME,
             "enabled" if self.fs_enabled else "DISABLED",
+            FS_TRANSCRIPTS_NAME,
+            "enabled" if self.transcripts_enabled else "disabled",
         )
         self._ready.set()
         return receipt
@@ -201,6 +223,12 @@ class PolicyState:
             )
             return
         disabled_list = params.get("disabled") or []
+        if FS_TRANSCRIPTS_NAME in disabled_list and self.transcripts_enabled:
+            self.transcripts_enabled = False
+            log.info(
+                "featureSets/update Notification applied as a narrowing: %s disabled",
+                FS_TRANSCRIPTS_NAME,
+            )
         if FS_NAME in disabled_list and self.fs_enabled:
             self.fs_enabled = False
             log.info(
@@ -215,6 +243,7 @@ class PolicyState:
     def _fail_closed(self, why: str) -> None:
         self.effective_capabilities = set()
         self.fs_enabled = False
+        self.transcripts_enabled = False
         self.policy_received = False
         log.warning("featureSets/update rejected — failing closed: %s", why)
         # Wake any waiter so registration does not hang on a refused policy;
