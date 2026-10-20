@@ -153,3 +153,27 @@ async def test_wait_ready_also_wakes_on_refusal_so_startup_never_hangs():
 )
 def test_host_speaks_0_5(caps, expected):
     assert host_speaks_0_5(caps) is expected
+
+
+def test_transcripts_set_follows_push_grant_independently_of_messaging():
+    from telegram_mcp.mcpl.policy import FS_TRANSCRIPTS_NAME
+
+    p = PolicyState()
+    p.apply({"effectiveCapabilities": list(FS_USES)}, is_request=True)
+    assert p.fs_enabled and not p.can_push_transcripts  # pushEvents not granted
+
+    p = PolicyState()
+    p.apply({"effectiveCapabilities": list(FS_USES) + ["pushEvents"]}, is_request=True)
+    assert p.fs_enabled and p.can_push_transcripts  # no `enabled` list: every set
+
+    p = PolicyState()
+    p.apply(
+        {"effectiveCapabilities": list(FS_USES) + ["pushEvents"], "enabled": [FS_NAME]},
+        is_request=True,
+    )
+    assert p.fs_enabled and not p.can_push_transcripts  # not selected
+
+    p = PolicyState()
+    p.apply({"effectiveCapabilities": list(FS_USES) + ["pushEvents"]}, is_request=True)
+    p.apply({"disabled": [FS_TRANSCRIPTS_NAME]}, is_request=False)
+    assert p.fs_enabled and not p.can_push_transcripts

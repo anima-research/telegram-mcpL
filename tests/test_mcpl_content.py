@@ -116,7 +116,7 @@ async def test_undownloadable_media_yields_placeholder_and_resource():
     msg = SimpleNamespace(message="", media=MessageMediaPhoto(), id=42)
     blocks = await message_to_content_blocks(msg, account_label="default", chat_id=100)
     assert blocks == [
-        {"type": "text", "text": "[photo]"},
+        {"type": "text", "text": "[photo, message_id 42]"},
         {"type": "resource", "uri": "telegram://message/default/100/42"},
     ]
 
@@ -155,7 +155,7 @@ async def test_oversize_photo_falls_back_to_placeholder():
     msg = FakeMessage(message="", media=MessageMediaPhoto(), id=9, data=big)
     blocks = await message_to_content_blocks(msg, account_label="default", chat_id=5)
     assert blocks == [
-        {"type": "text", "text": "[photo]"},
+        {"type": "text", "text": "[photo, message_id 9]"},
         {"type": "resource", "uri": "telegram://message/default/5/9"},
     ]
 
@@ -180,7 +180,7 @@ async def test_oversize_image_document_skipped_by_declared_size():
     msg = FakeMessage(media=MessageMediaDocument(doc), id=11, data=b"unused")
     blocks = await message_to_content_blocks(msg, account_label="default", chat_id=8)
     assert blocks == [
-        {"type": "text", "text": "[document]"},
+        {"type": "text", "text": "[document, message_id 11]"},
         {"type": "resource", "uri": "telegram://message/default/8/11"},
     ]
 
@@ -225,7 +225,7 @@ async def test_oversize_text_document_falls_back():
     msg = FakeMessage(media=MessageMediaDocument(doc), id=12, data=b"unused")
     blocks = await message_to_content_blocks(msg, account_label="default", chat_id=8)
     assert blocks == [
-        {"type": "text", "text": "[document]"},
+        {"type": "text", "text": "[document, message_id 12]"},
         {"type": "resource", "uri": "telegram://message/default/8/12"},
     ]
 
@@ -239,6 +239,26 @@ async def test_binary_document_stays_placeholder():
     msg = FakeMessage(media=MessageMediaDocument(doc), id=13, data=b"%PDF-1.7")
     blocks = await message_to_content_blocks(msg, account_label="default", chat_id=8)
     assert blocks == [
-        {"type": "text", "text": "[document]"},
+        {"type": "text", "text": "[document, message_id 13]"},
         {"type": "resource", "uri": "telegram://message/default/8/13"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_captioned_voice_note_still_names_its_message():
+    # A voice note with a caption used to get no placeholder at all, leaving the
+    # agent no message id to pass to transcribe_voice / download_media.
+    class DocumentAttributeAudio:  # a voice note's attribute, by class name
+        def __init__(self, voice):
+            self.voice = voice
+
+    doc = FakeDocument(mime_type="audio/ogg", size=4096,
+                       attributes=[DocumentAttributeAudio(voice=True)])
+    msg = FakeMessage(message="listen to this", media=MessageMediaDocument(doc), id=3,
+                      data=b"OggS")
+    blocks = await message_to_content_blocks(msg, account_label="default", chat_id=74)
+    assert blocks == [
+        {"type": "text", "text": "listen to this"},
+        {"type": "text", "text": "[voice, message_id 3]"},
+        {"type": "resource", "uri": "telegram://message/default/74/3"},
     ]
